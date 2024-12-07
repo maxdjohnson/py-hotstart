@@ -123,7 +123,7 @@ def _run_forkserver_loop(address):
                 # Child process
                 os.setsid()
 
-                fd = os.open(tty_name, os.O_RDWR)
+                fd = os.open(tty_name, os.O_RDWR | os.O_NOCTTY)
                 fcntl.ioctl(fd, termios.TIOCSCTTY, 0)
                 os.dup2(fd, 0)
                 os.dup2(fd, 1)
