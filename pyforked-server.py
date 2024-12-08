@@ -10,7 +10,6 @@ import traceback
 SERVER_ADDRESS = "/tmp/pyforked-server.sock"
 LOG_PATH = os.path.expanduser("~/Library/Logs/pyforked-server.log")
 PIDFILE = "/tmp/pyforked-server.pid"
-SERVER_PID = os.getpid()
 MAXFD = 2048
 
 
@@ -42,9 +41,9 @@ def daemonize():
         os.close(log_fd)
 
 
-def write_pidfile():
+def write_pidfile(pid):
     with open(PIDFILE, "w") as f:
-        f.write(str(SERVER_PID))
+        f.write(str(pid))
 
 
 def remove_pidfile():
@@ -141,8 +140,8 @@ def handle_client(conn):
         print(f"Error sending OK to client: {e}")
 
 
-def shutdown(server):
-    if os.getpid() != SERVER_PID:
+def shutdown(server, server_pid):
+    if os.getpid() != server_pid:
         # This is not the original parent process; do not remove pidfile.
         return
     print("Received shutdown signal, terminating forkserver.")
@@ -154,6 +153,8 @@ def shutdown(server):
 
 
 def run_forkserver():
+    server_pid = os.getpid()
+
     if os.path.exists(SERVER_ADDRESS):
         os.unlink(SERVER_ADDRESS)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -162,12 +163,12 @@ def run_forkserver():
 
     # Handle signals for clean shutdown
     def handle_signal(signum, frame):
-        shutdown(server)
+        shutdown(server, server_pid)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    write_pidfile()
+    write_pidfile(server_pid)
 
     while True:
         try:
