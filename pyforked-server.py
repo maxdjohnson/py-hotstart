@@ -1,5 +1,4 @@
 import array
-import code
 import fcntl
 import os
 import resource
@@ -10,6 +9,8 @@ import traceback
 
 SERVER_ADDRESS = "/tmp/pyforked-server.sock"
 LOG_PATH = os.path.expanduser("~/Library/Logs/pyforked-server.log")
+PIDFILE = "/tmp/pyforked-server.pid"
+SERVER_PID = os.getpid()
 MAXFD = 2048
 
 
@@ -41,6 +42,16 @@ def daemonize():
         os.close(log_fd)
 
 
+def write_pidfile():
+    with open(PIDFILE, "w") as f:
+        f.write(str(SERVER_PID))
+
+
+def remove_pidfile():
+    if os.path.exists(PIDFILE):
+        os.remove(PIDFILE)
+
+
 def recv_fds(conn, max_fds=1):
     buf = bytearray(1024)
     fds = array.array("i", [-1] * max_fds)
@@ -57,12 +68,11 @@ def recv_fds(conn, max_fds=1):
         if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
             fds.frombytes(cmsg_data)
     data = buf[:msg]
-    # Filter out invalid fds
     out_fds = [fd for fd in fds if fd != -1]
     return data, out_fds
 
 
-def run_child(slave_fd):
+def run_child(slave_fd, code_snippet):
     # In the child:
     try:
         os.setsid()
@@ -73,13 +83,20 @@ def run_child(slave_fd):
         if slave_fd > 2:
             os.close(slave_fd)
 
-        # If the master is closed, reading from stdin will return EOF.
-        # code.interact() doesn't handle EOF by default, so wrap it:
+        # If no code snippet provided, just exit or do something default:
+        if not code_snippet.strip():
+            # If desired, run an empty snippet just exits immediately.
+            # code.interact(local={}) # or revert to an interactive shell if needed
+            return
+
+        # Execute the provided code snippet
+        # It's safer to exec in a controlled namespace.
+        local_ns = {}
         try:
-            code.interact(local={})
-        except EOFError:
-            # Master fd closed, just exit gracefully
-            pass
+            exec(code_snippet, {}, local_ns)
+        except BaseException:
+            traceback.print_exc()
+
     except BaseException:
         traceback.print_exc()
     finally:
@@ -88,10 +105,19 @@ def run_child(slave_fd):
 
 def handle_client(conn):
     msg, fds = recv_fds(conn)
-    if msg != b"RUN":
+    if not msg.startswith(b"RUN"):
         if msg:
             print(f"Invalid command: {msg}")
         return
+
+    # Extract code snippet:
+    # if msg = b"RUN print('hello')", then code_snippet = "print('hello')"
+    # If msg = b"RUN", then code_snippet = "" (no code)
+    parts = msg.split(b" ", 1)
+    if len(parts) == 1:
+        code_snippet = ""
+    else:
+        code_snippet = parts[1].decode("utf-8", errors="replace")
 
     if not fds:
         print("No fds received or invalid fd.")
@@ -102,20 +128,29 @@ def handle_client(conn):
         print("Invalid slave fd received.")
         return
 
-    # Fork the child that will run code.interact
     pid = os.fork()
     if pid == 0:
-        run_child(slave_fd)
+        run_child(slave_fd, code_snippet)
     else:
         # parent
         os.close(slave_fd)
 
-    # Attempt to send OK
-    # If the client disconnected right after sending the fd, sendall might fail
     try:
         conn.sendall(b"OK")
     except OSError as e:
         print(f"Error sending OK to client: {e}")
+
+
+def shutdown(server):
+    if os.getpid() != SERVER_PID:
+        # This is not the original parent process; do not remove pidfile.
+        return
+    print("Received shutdown signal, terminating forkserver.")
+    server.close()
+    if os.path.exists(SERVER_ADDRESS):
+        os.unlink(SERVER_ADDRESS)
+    remove_pidfile()
+    os._exit(0)
 
 
 def run_forkserver():
@@ -125,17 +160,14 @@ def run_forkserver():
     server.bind(SERVER_ADDRESS)
     server.listen(5)
 
-    # Optionally handle signals for clean shutdown
-    # For example, to gracefully stop on SIGTERM:
-    def shutdown(signum, frame):
-        print("Received shutdown signal, terminating forkserver.")
-        server.close()
-        if os.path.exists(SERVER_ADDRESS):
-            os.unlink(SERVER_ADDRESS)
-        os._exit(0)
+    # Handle signals for clean shutdown
+    def handle_signal(signum, frame):
+        shutdown(server)
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    write_pidfile()
 
     while True:
         try:
@@ -144,7 +176,6 @@ def run_forkserver():
             print(f"Error on accept: {e}")
             continue
 
-        # If client closes immediately, conn might be invalid
         with conn:
             try:
                 handle_client(conn)
