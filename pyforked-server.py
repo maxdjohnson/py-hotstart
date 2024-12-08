@@ -53,7 +53,7 @@ def run_forkserver():
             try:
                 # Receive a message and a fd (the slave pty fd)
                 # We'll do recvmsg to get the fd
-                msg, fds = recv_fds(conn.fileno())
+                msg, fds = recv_fds(conn)
                 if msg != b"RUN":
                     continue
 
@@ -86,14 +86,10 @@ def run_forkserver():
                 traceback.print_exc()
 
 
-def recv_fds(sock_fd, max_fds=1):
-    import socket
-
+def recv_fds(conn, max_fds=1):
     buf = bytearray(1024)
     fds = array.array("i", [-1] * max_fds)
-    msg, ancdata, flags, addr = socket.socket(fileno=sock_fd).recvmsg_into(
-        [buf], 1024, socket.CMSG_SPACE(max_fds * 4)
-    )
+    msg, ancdata, flags, addr = conn.recvmsg_into([buf], 1024, socket.CMSG_SPACE(max_fds * 4))
     for cmsg_level, cmsg_type, cmsg_data in ancdata:
         if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
             fds.frombytes(cmsg_data)

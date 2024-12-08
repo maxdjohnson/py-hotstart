@@ -6,7 +6,7 @@ use nix::sys::socket::{
     sendmsg, recvmsg, ControlMessage, MsgFlags,
 };
 use nix::unistd::{close, read, write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::io::{IoSlice, IoSliceMut};
 use std::process::exit;
 
@@ -19,8 +19,10 @@ fn main() {
     let slave_fd = pty.slave;
 
     // Convert the standard input/output to BorrowedFd
-    let stdin_borrowed = std::io::stdin().as_fd();
-    let stdout_borrowed = std::io::stdout().as_fd();
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_borrowed = stdin.as_fd();
+    let stdout_borrowed = stdout.as_fd();
 
     // Socket to communicate with the forkserver
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
@@ -31,15 +33,20 @@ fn main() {
     // Send slave_fd via SCM_RIGHTS
     {
         let iov = [IoSlice::new(b"RUN")];
-        let cmsg = [ControlMessage::ScmRights(&[slave_fd.as_raw_fd()])];
+        let fd_arr = [slave_fd.as_raw_fd()];
+        let cmsg = [ControlMessage::ScmRights(&fd_arr)];
         sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).expect("sendmsg failed");
     }
 
     // Receive response from server
     let mut buf = [0u8; 1024];
-    let mut iov = [IoSliceMut::new(&mut buf)];
-    let msg = recvmsg::<()>(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty()).expect("recvmsg failed");
-    let response = &buf[..msg.bytes];
+    let msg_bytes = {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let msg = recvmsg::<()>(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty())
+            .expect("recvmsg failed");
+        msg.bytes
+    };
+    let response = &buf[..msg_bytes];
     if response != b"OK" {
         eprintln!("Server did not respond with OK");
         exit(1);
