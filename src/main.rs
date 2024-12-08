@@ -65,12 +65,14 @@ fn run() -> Result<(), String> {
 fn run_notty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, stderr_fd: BorrowedFd<'_>, code_snippet: &str) -> Result<(), String> {
     // Create a pipe for the child to indicate when it's done (waitpid doens't work on non-children)
     let (read_fd, write_fd) = pipe().map_err(|e| format!("Failed to create pipe: {}", e))?;
+
     // Construct the request and send
     let message = format!("RUN {}", code_snippet);
     let fd_arr = [stdin_fd.as_raw_fd(), stdout_fd.as_raw_fd(), stderr_fd.as_raw_fd(), write_fd.as_raw_fd()];
     forkserver_req(&message, &fd_arr)
         .map_err(|e| format!("Failed to communicate with forkserver: {}", e))?;
     drop(write_fd);
+
     // Wait for EOF on read_fd indicating child closed
     let mut buf = [0u8; 1];
     while read(read_fd.as_raw_fd(), &mut buf).map_err(|e| format!("Failed to read from pipe: {}", e))? > 0 {}
@@ -83,6 +85,7 @@ fn run_pty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, code_snippet: &s
     let mut termios = tcgetattr(stdin_fd)
         .map_err(|e| format!("Failed to get terminal attributes: {}", e))?;
     termios.local_flags |= LocalFlags::ICANON;
+    termios.local_flags &= !LocalFlags::ECHO;
 
     // Get current window size
     let ws = get_winsize(stdin_fd.as_fd());
@@ -149,7 +152,6 @@ fn run_pty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, code_snippet: &s
                 }
                 Ok(0) => {
                     // Child process exited or master closed
-                    eprintln!("Child exited or master closed. Ending session.");
                     break;
                 }
                 Err(_) => {
@@ -160,10 +162,10 @@ fn run_pty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, code_snippet: &s
         }
     }
 
-    eprintln!("CLI shutting down cleanly.");
     Ok(())
 }
 
+// Make a request to the forkserver, returning the pid of the new process.
 fn forkserver_req(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
     // Connect to the forkserver
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
