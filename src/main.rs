@@ -1,3 +1,6 @@
+mod forkserver_client;
+use std::process::exit;
+
 use nix::errno::Errno;
 use signal_hook::flag;
 use nix::pty::openpty;
@@ -12,23 +15,6 @@ use std::env;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// According to the prompt, attach_child is already implemented as:
-//
-// fn attach_child(pid: nix::unistd::Pid, slave_fd: impl std::os::fd::AsRawFd) -> nix::Result<()>;
-extern "C" {
-    fn attach_child(pid: Pid, fd: std::os::raw::c_int) -> i32;
-}
-
-// For Rust call, we wrap attach_child:
-// We'll assume it returns 0 on success, else sets errno or something similar.
-fn attach_child_wrapper(pid: Pid, fd: &impl AsFd) -> nix::Result<()> {
-    let ret = unsafe { attach_child(pid, fd.as_fd().as_raw_fd()) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(nix::Error::last())
-    }
-}
 
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
@@ -55,7 +41,7 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), Error> {
 }
 
 
-fn setup_raw() -> nix::Result<Termios> {
+fn setup_terminal_raw() -> nix::Result<Termios> {
     let mut termios = tcgetattr(std::io::stdin().as_fd())?;
     let saved = termios.clone();
     cfmakeraw(&mut termios);
@@ -63,33 +49,32 @@ fn setup_raw() -> nix::Result<Termios> {
     Ok(saved)
 }
 
-fn resize_pty<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
+fn get_winsize(fd: impl AsRawFd) -> Option<libc::winsize> {
     let mut ws = libc::winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-
-    let stdin_fd = std::io::stdin().as_fd().as_raw_fd();
-    let pty_raw = pty_fd.as_fd().as_raw_fd();
-
-    unsafe {
-        // tiocgwinsz requires a pointer to winsize. We'll do a read-modify:
-        if tiocgwinsz(stdin_fd, &mut ws as *mut libc::winsize).is_err() {
-            // fallback
-            let default_size = libc::winsize {
-                ws_row: 30,
-                ws_col: 80,
-                ws_xpixel: 640,
-                ws_ypixel: 480,
-            };
-            tiocswinsz(pty_raw, &default_size as *const libc::winsize)?;
-            return Ok(());
-        }
-        tiocswinsz(pty_raw, &ws as *const libc::winsize)?;
+    let res = unsafe { tiocgwinsz(fd.as_raw_fd(), &mut ws) };
+    if res.is_ok() {
+        Some(ws)
+    } else {
+        None
     }
+}
 
+fn resize_pty<Fd: AsRawFd>(pty_fd: Fd) -> nix::Result<()> {
+    // Get stdin winsize or fallback to a default
+    let ws = get_winsize(std::io::stdin()).unwrap_or(libc::winsize {
+        ws_row: 30,
+        ws_col: 80,
+        ws_xpixel: 640,
+        ws_ypixel: 480,
+    });
+
+    let pty_raw = pty_fd.as_raw_fd();
+    unsafe { tiocswinsz(pty_raw, &ws)?; }
     Ok(())
 }
 
@@ -102,7 +87,7 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
     // Handle SIGWINCH by setting flag so it can be delivered to child.
     flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&winch_happened)).expect("failed to register SIGWINCH");
 
-    resize_pty(&pty_fd)?;
+    resize_pty(pty_fd.as_fd())?;
 
     let mut buf = [0u8; 4096];
 
@@ -114,7 +99,7 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
     let sigmask_empty = SigSet::empty();
     loop {
         if winch_happened.swap(false, Ordering::SeqCst) {
-            resize_pty(&pty_fd)?;
+            resize_pty(pty_fd.as_fd())?;
         }
 
         let mut readfds = FdSet::new();
@@ -147,36 +132,44 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        die("Usage: reptyr_rust <pid>");
-    }
+fn run() -> Result<(), String> {
+    // Parse arguments to obtain either `code_snippet` or `module_name`.
+    let (code_snippet, module_name) = parse_arguments(env::args().skip(1))?;
 
-    let pid_val = match args[1].parse::<i32>() {
-        Ok(v) if v > 0 => v,
-        _ => die("Invalid pid: must be a positive integer"),
+    // If a module name is provided, ignore the code snippet and run the module.
+    let code_snippet = if !module_name.is_empty() {
+        format!(
+            "import runpy; runpy.run_module('{}', run_name='__main__')",
+            module_name
+        )
+    } else if code_snippet.is_empty() {
+        // Default snippet: run a Python REPL
+        "import code; code.interact(local={})".to_string()
+    } else {
+        code_snippet
     };
 
-    let pid = Pid::from_raw(pid_val);
+    // Check forkserver status from PIDFILE
+    forkserver_client::ensure_alive()?;
+
+    let original_winsize = get_winsize(std::io::stdin());
+    let original_termios = match setup_terminal_raw() {
+        Ok(t) => t,
+        Err(e) => die(&format!("Unable to set terminal attributes: {}", e)),
+    };
 
     // Use openpty to obtain master/slave fds
-    let (master, slave) = match openpty(None, None) {
+    let (master, slave) = match openpty(&original_winsize, Some(&original_termios)) {
         Ok(p) => (p.master, p.slave),
         Err(e) => die(&format!("Unable to allocate pty: {}", e)),
     };
 
-    // Attach child to slave pty
-    if let Err(e) = attach_child_wrapper(pid, &slave) {
-        eprintln!("Unable to attach to pid {}: {}", pid_val, e);
+    // Spawn child and attach to slave pty
+    if let Err(e) = attach_child_wrapper(&code_snippet, &slave) {
+        eprintln!("Unable to request fork: {}", e);
         std::process::exit(1);
     }
     drop(slave);
-
-    let saved_termios = match setup_raw() {
-        Ok(t) => t,
-        Err(e) => die(&format!("Unable to set terminal attributes: {}", e)),
-    };
 
     if let Err(e) = do_proxy(&master) {
         eprintln!("Error in do_proxy: {}", e);
@@ -184,10 +177,51 @@ fn main() {
 
     // Restore terminal attributes
     loop {
-        match tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &saved_termios) {
+        match tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &original_termios) {
             Ok(_) => break,
             Err(Error::EINTR) => continue,
             Err(e) => die(&format!("Unable to tcsetattr: {}", e)),
         }
     }
+    Ok(())
+}
+
+/// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
+fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String), String> {
+    let mut code_snippet = String::new();
+    let mut module_name = String::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" => {
+                code_snippet = args
+                    .next()
+                    .ok_or("No code snippet provided after -c".to_string())?;
+            }
+            "-m" => {
+                module_name = args
+                    .next()
+                    .ok_or("No module name provided after -m".to_string())?;
+            }
+            other => {
+                return Err(format!("Unknown argument: {}", other));
+            }
+        }
+    }
+
+    Ok((code_snippet, module_name))
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        exit(1);
+    }
+}
+
+fn attach_child_wrapper(code_snippet: &str, fd: &impl AsRawFd) -> Result<(), String> {
+    let message = format!("RUN_PTY {}", code_snippet);
+    let fd_arr = [fd.as_raw_fd()];
+    forkserver_client::request_fork(&message, &fd_arr)?;
+    Ok(())
 }

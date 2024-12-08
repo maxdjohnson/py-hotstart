@@ -61,6 +61,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+
 /// Runs code in non-TTY mode by passing file descriptors directly to the forkserver
 fn run_notty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, stderr_fd: BorrowedFd<'_>, code_snippet: &str) -> Result<(), String> {
     // Create a pipe for the child to indicate when it's done (waitpid doens't work on non-children)
@@ -163,55 +164,6 @@ fn run_pty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, code_snippet: &s
     }
 
     Ok(())
-}
-
-// Make a request to the forkserver, returning the pid of the new process.
-fn forkserver_req(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
-    // Connect to the forkserver
-    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
-        .map_err(|e| format!("socket creation failed: {}", e))?;
-    let addr = UnixAddr::new(SERVER_ADDRESS).map_err(|e| format!("UnixAddr failed: {}", e))?;
-    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}", e))?;
-
-    // Send the slave_fd along with the message
-    let cmsg = [ControlMessage::ScmRights(fd_arr)];
-    let iov = [IoSlice::new(command.as_bytes())];
-
-    nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-        .map_err(|e| format!("Failed to send message and fd to server: {}", e))?;
-
-    // Receive response from server
-    let mut buf = [0u8; 1024];
-    let response_size = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = nix::sys::socket::recvmsg::<()>(
-            fd.as_raw_fd(),
-            &mut iov,
-            None,
-            MsgFlags::empty(),
-        )
-        .map_err(|e| format!("Error receiving response from server: {}", e))?;
-
-        if msg.bytes == 0 {
-            return Err("Server disconnected prematurely (no data).".into());
-        }
-        msg.bytes
-    };
-
-    // Get response string
-    let response = &buf[..response_size];
-    let response_str = std::str::from_utf8(response)
-        .map_err(|_| "Server response was not valid UTF-8".to_string())?;
-
-    // Parse PID
-    let parts: Vec<&str> = response_str.split_whitespace().collect();
-    if parts.len() != 2 || parts[0] != "OK" {
-        return Err(format!("Server responded with invalid message: {:?}", response_str));
-    }
-    let pid = parts[1].parse::<i32>()
-        .map_err(|_| format!("Server responded with invalid PID: {}", parts[1]))?;
-
-    Ok(pid)
 }
 
 /// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
