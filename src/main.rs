@@ -1,214 +1,143 @@
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::pty::openpty;
 use nix::ioctl_read;
 use nix::libc::{winsize, TIOCGWINSZ};
-use nix::unistd::isatty;
-use nix::unistd::Pid;
-use nix::sys::signal;
+use nix::pty::openpty;
 use nix::sys::select::{select, FdSet};
+use nix::sys::signal;
 use nix::sys::socket::{
-    AddressFamily, UnixAddr, SockType, SockFlag, socket, connect,
-    sendmsg, recvmsg, ControlMessage, MsgFlags,
+    connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use nix::sys::termios::{tcgetattr, LocalFlags};
-use nix::unistd::{read, write};
-use std::os::fd::{AsFd, AsRawFd};
-use std::io::{IoSlice, IoSliceMut};
-use std::process::exit;
-use std::fs;
+use nix::unistd::{isatty, read, write, Pid};
 use std::env;
+use std::fs;
+use std::io::{IoSlice, IoSliceMut};
+use std::os::fd::{AsFd, AsRawFd};
+use std::process::exit;
 
 const PIDFILE: &str = "/tmp/pyforked-server.pid";
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
-const CTRL_D: u8 = 0x04;
 
-// Define the tiocgwinsz ioctl operation
 ioctl_read!(tiocgwinsz, TIOCGWINSZ, 0, winsize);
 
 fn main() {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let stdin_borrowed = stdin.as_fd();
-    let stdout_borrowed = stdout.as_fd();
-
-    // Check if stdin is a TTY
-    if !isatty(stdin.as_raw_fd()).unwrap_or(false) {
-        eprintln!("stdin is not a tty, cannot inherit terminfo");
-        std::process::exit(1);
-    }
-    // Parse arguments
-    // Supported:
-    // -c code_snippet
-    // -m module_name
-    // If neither is given, default snippet runs REPL
-    let args: Vec<String> = env::args().collect();
-    let mut code_snippet = String::new();
-    let mut module_name = String::new();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-c" => {
-                i += 1;
-                if i < args.len() {
-                    code_snippet = args[i].clone();
-                } else {
-                    eprintln!("No code snippet provided after -c");
-                    exit(1);
-                }
-            }
-            "-m" => {
-                i += 1;
-                if i < args.len() {
-                    module_name = args[i].clone();
-                } else {
-                    eprintln!("No module name provided after -m");
-                    exit(1);
-                }
-            }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    // If module_name is given, ignore code_snippet and generate snippet for module.
-    if !module_name.is_empty() {
-        code_snippet = format!("import runpy; runpy.run_module('{}', run_name='__main__')", module_name);
-    } else if code_snippet.is_empty() {
-        // Default snippet: run a Python REPL
-        code_snippet = "import code; code.interact(local={})".to_string();
-    }
-
-    // Check if forkserver is running by checking pidfile
-    let pid = match fs::read_to_string(PIDFILE) {
-        Ok(s) => s.trim().parse::<i32>().ok(),
-        Err(_) => None,
-    };
-    if pid.is_none() {
-        eprintln!("Forkserver not running (no pidfile). Please start it first.");
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
         exit(1);
     }
-    let pid = pid.unwrap();
+}
 
-    // Check if process with that pid is alive
-    if let Err(err) = signal::kill(Pid::from_raw(pid), None) {
-        if err == nix::errno::Errno::ESRCH {
-            eprintln!(
-                "No process with pid {} is alive. The forkserver might have crashed. Please restart it.",
-                pid
-            );
-            exit(1);
-        } else {
-            eprintln!("Failed to check process status: {}", err);
-            exit(1);
-        }
+fn run() -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_fd = stdin.as_fd();
+    let stdout_fd = stdout.as_fd();
+
+    // Check if stdin is a TTY
+    if !isatty(stdin_fd.as_raw_fd()).unwrap_or(false) {
+        return Err("stdin is not a tty; cannot inherit terminal information".into());
     }
 
-    // Construct the message: "RUN <code_snippet>"
+    // Parse arguments to obtain either `code_snippet` or `module_name`.
+    let (code_snippet, module_name) = parse_arguments(env::args().skip(1))?;
+
+    // If a module name is provided, ignore the code snippet and run the module.
+    let code_snippet = if !module_name.is_empty() {
+        format!(
+            "import runpy; runpy.run_module('{}', run_name='__main__')",
+            module_name
+        )
+    } else if code_snippet.is_empty() {
+        // Default snippet: run a Python REPL
+        "import code; code.interact(local={})".to_string()
+    } else {
+        code_snippet
+    };
+
+    // Check forkserver status from PIDFILE
+    let pid = read_pid_file(PIDFILE)?;
+    ensure_process_alive(pid)?;
+
+    // Construct the message to send
     let mut message = b"RUN".to_vec();
     if !code_snippet.is_empty() {
         message.push(b' ');
         message.extend_from_slice(code_snippet.as_bytes());
     }
 
-    // Get current terminal attributes from CLI
-    let mut termios = match tcgetattr(&stdin) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to get terminal attributes: {}", e);
-            std::process::exit(1);
-        }
-    };
-    // Ensure canonical mode:
+    // Get current terminal settings
+    let mut termios = tcgetattr(&stdin_fd)
+        .map_err(|e| format!("Failed to get terminal attributes: {}", e))?;
     termios.local_flags |= LocalFlags::ICANON;
 
     // Get current window size
-    let ws = get_winsize(&stdin);
+    let ws = get_winsize(stdin_fd.as_fd());
 
-    // Allocate pty locally
-    let pty = openpty(&ws, Some(&termios)).expect("openpty failed");
+    // Open a pty
+    let pty = openpty(&ws, Some(&termios)).map_err(|e| format!("openpty failed: {}", e))?;
     let master_fd = pty.master;
     let slave_fd = pty.slave;
 
-
-    // Connect to forkserver
+    // Connect to the forkserver
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
-        .expect("socket failed");
-    let addr = UnixAddr::new(SERVER_ADDRESS).expect("UnixAddr failed");
+        .map_err(|e| format!("socket creation failed: {}", e))?;
+    let addr = UnixAddr::new(SERVER_ADDRESS).map_err(|e| format!("UnixAddr failed: {}", e))?;
+    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}", e))?;
 
-    if let Err(e) = connect(fd.as_raw_fd(), &addr) {
-        eprintln!("Unable to connect to forkserver: {}", e);
-        exit(1);
-    }
-
-    // Send slave_fd via SCM_RIGHTS along with the message
+    // Send the slave_fd along with the message
     let fd_arr = [slave_fd.as_raw_fd()];
     let cmsg = [ControlMessage::ScmRights(&fd_arr)];
     let iov = [IoSlice::new(&message)];
 
-    if let Err(e) = sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None) {
-        eprintln!("Failed to send message and fd to server: {}", e);
-        exit(1);
-    }
+    nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+        .map_err(|e| format!("Failed to send message and fd to server: {}", e))?;
 
     // Receive response from server
     let mut buf = [0u8; 1024];
-    let msg_bytes = {
+    let response_size = {
         let mut iov = [IoSliceMut::new(&mut buf)];
-        match recvmsg::<()>(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty()) {
-            Ok(msg) => {
-                if msg.bytes == 0 {
-                    eprintln!("Server disconnected prematurely (no data).");
-                    exit(1);
-                }
-                msg.bytes
-            },
-            Err(e) => {
-                eprintln!("Error receiving response from server: {}", e);
-                exit(1);
-            }
+        let msg = nix::sys::socket::recvmsg::<()>(
+            fd.as_raw_fd(),
+            &mut iov,
+            None,
+            MsgFlags::empty(),
+        )
+        .map_err(|e| format!("Error receiving response from server: {}", e))?;
+
+        if msg.bytes == 0 {
+            return Err("Server disconnected prematurely (no data).".into());
         }
+        msg.bytes
     };
 
-    let response = &buf[..msg_bytes];
+    let response = &buf[..response_size];
     if response != b"OK" {
-        eprintln!("Server responded with invalid message: {:?}", response);
-        exit(1);
+        return Err(format!("Server responded with invalid message: {:?}", response));
     }
 
-    // Close slave fd locally
+    // Close slave fd locally as we no longer need it
     drop(slave_fd);
 
-    // Set nonblocking
-    set_nonblocking(stdin_borrowed.as_raw_fd());
-    set_nonblocking(stdout_borrowed.as_raw_fd());
-    set_nonblocking(master_fd.as_raw_fd());
+    // Set stdin, stdout, and master_fd to non-blocking mode
+    set_nonblocking(stdin_fd.as_raw_fd())?;
+    set_nonblocking(stdout_fd.as_raw_fd())?;
+    set_nonblocking(master_fd.as_raw_fd())?;
 
     let mut buf_in = [0u8; 1024];
     let mut buf_out = [0u8; 1024];
 
-    let mut stdin_eof = false;
-
     loop {
         let mut fds = FdSet::new();
-        // Only listen on stdin if we haven't hit EOF yet
-        if !stdin_eof {
-            fds.insert(stdin_borrowed);
-        }
         fds.insert(master_fd.as_fd());
+        fds.insert(stdin_fd);
 
-        let nfds = std::cmp::max(stdin_borrowed.as_raw_fd(), master_fd.as_raw_fd()) + 1;
-        let res = select(nfds, Some(&mut fds), None, None, None);
-        if let Err(e) = res {
-            eprintln!("select error: {}", e);
-            break;
-        }
+        let nfds = std::cmp::max(stdin_fd.as_raw_fd(), master_fd.as_raw_fd()) + 1;
+        select(nfds, Some(&mut fds), None, None, None)
+            .map_err(|e| format!("select error: {}", e))?;
 
-        // If something happened on stdin and not EOF yet
-        if !stdin_eof && fds.contains(stdin_borrowed) {
-            match read(stdin_borrowed.as_raw_fd(), &mut buf_in) {
+        // If there's input available on stdin
+        if fds.contains(stdin_fd) {
+            match read(stdin_fd.as_raw_fd(), &mut buf_in) {
                 Ok(n) if n > 0 => {
                     if !write_all(&master_fd.as_fd(), &buf_in[..n]) {
                         eprintln!("Error writing to master fd.");
@@ -216,20 +145,21 @@ fn main() {
                     }
                 }
                 Ok(0) => {
-                    // EOF on stdin, user closed input. Stop the session.
+                    // EOF on stdin, end the session
                     break;
                 }
                 Err(_) => {
-                    // Non-fatal error or EAGAIN
+                    // EAGAIN or non-fatal error, just ignore and continue
                 }
                 _ => {}
             }
         }
 
+        // If there's data available from the child process through master_fd
         if fds.contains(master_fd.as_fd()) {
             match read(master_fd.as_raw_fd(), &mut buf_out) {
                 Ok(n) if n > 0 => {
-                    if !write_all(&stdout_borrowed, &buf_out[..n]) {
+                    if !write_all(&stdout_fd, &buf_out[..n]) {
                         eprintln!("Error writing to stdout.");
                         break;
                     }
@@ -240,7 +170,7 @@ fn main() {
                     break;
                 }
                 Err(_) => {
-                    // Non-fatal error or EAGAIN
+                    // EAGAIN or non-fatal error
                 }
                 _ => {}
             }
@@ -248,8 +178,62 @@ fn main() {
     }
 
     eprintln!("CLI shutting down cleanly.");
+    Ok(())
 }
 
+/// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
+fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String), String> {
+    let mut code_snippet = String::new();
+    let mut module_name = String::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" => {
+                code_snippet = args
+                    .next()
+                    .ok_or("No code snippet provided after -c".to_string())?;
+            }
+            "-m" => {
+                module_name = args
+                    .next()
+                    .ok_or("No module name provided after -m".to_string())?;
+            }
+            other => {
+                return Err(format!("Unknown argument: {}", other));
+            }
+        }
+    }
+
+    Ok((code_snippet, module_name))
+}
+
+/// Read the PID from the given pidfile and return it.
+fn read_pid_file(path: &str) -> Result<i32, String> {
+    let pid_str = fs::read_to_string(path).map_err(|_| {
+        "Forkserver not running (no pidfile). Please start it first.".to_string()
+    })?;
+    pid_str
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "Invalid PID in pidfile".to_string())
+}
+
+/// Ensure that the given PID corresponds to a currently running process.
+fn ensure_process_alive(pid: i32) -> Result<(), String> {
+    if let Err(err) = signal::kill(Pid::from_raw(pid), None) {
+        if err == nix::errno::Errno::ESRCH {
+            return Err(format!(
+                "No process with pid {} is alive. The forkserver might have crashed. Please restart it.",
+                pid
+            ));
+        } else {
+            return Err(format!("Failed to check process status: {}", err));
+        }
+    }
+    Ok(())
+}
+
+/// Get the current window size using the `tiocgwinsz` ioctl.
 fn get_winsize(fd: impl AsFd) -> Option<winsize> {
     let mut ws = winsize {
         ws_row: 0,
@@ -257,8 +241,6 @@ fn get_winsize(fd: impl AsFd) -> Option<winsize> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-
-    // Use the generated ioctl function
     let res = unsafe { tiocgwinsz(fd.as_fd().as_raw_fd(), &mut ws) };
     if res.is_ok() {
         Some(ws)
@@ -267,28 +249,25 @@ fn get_winsize(fd: impl AsFd) -> Option<winsize> {
     }
 }
 
+/// Write all data to the given file descriptor.
 fn write_all(fd: &impl AsFd, mut data: &[u8]) -> bool {
     while !data.is_empty() {
         match write(fd, data) {
-            Ok(n) if n > 0 => {
-                data = &data[n..];
-            }
-            Ok(0) => {
-                // Handle unexpected EOF or write returning 0
-                return false;
-            }
-            Err(_) => {
-                // Handle write error
-                return false;
-            }
+            Ok(n) if n > 0 => data = &data[n..],
+            Ok(0) => return false, // Unexpected EOF or no progress
+            Err(_) => return false, // Handle write error
             _ => unreachable!(),
         }
     }
     true
 }
 
-fn set_nonblocking(fd: i32) {
-    let flags = fcntl(fd, FcntlArg::F_GETFL).unwrap();
+/// Set a file descriptor to non-blocking mode.
+fn set_nonblocking(fd: i32) -> Result<(), String> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL)
+        .map_err(|e| format!("F_GETFL failed: {}", e))?;
     let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-    fcntl(fd, FcntlArg::F_SETFL(new_flags)).unwrap();
+    fcntl(fd, FcntlArg::F_SETFL(new_flags))
+        .map_err(|e| format!("F_SETFL failed: {}", e))?;
+    Ok(())
 }
