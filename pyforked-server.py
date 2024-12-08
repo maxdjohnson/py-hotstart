@@ -71,16 +71,23 @@ def recv_fds(conn, max_fds=1):
     return data, out_fds
 
 
-def run_child(slave_fd, code_snippet):
+def run_child(cmd, code_snippet, fds):
     # In the child:
     try:
         os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-        os.dup2(slave_fd, 0)
-        os.dup2(slave_fd, 1)
-        os.dup2(slave_fd, 2)
-        if slave_fd > 2:
-            os.close(slave_fd)
+        if cmd == "RUN_PTY":
+            # We are meant to run in a pty. Set it as the controlling terminal.
+            (slave_fd,) = fds
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+        elif cmd == "RUN":
+            # We are running outside a tty. Use the provided FDs
+            for i in range(3):
+                os.dup2(fds[i], i)
 
         # If no code snippet provided, just exit or do something default:
         if not code_snippet.strip():
@@ -104,40 +111,26 @@ def run_child(slave_fd, code_snippet):
 
 def handle_client(conn):
     msg, fds = recv_fds(conn)
-    if not msg.startswith(b"RUN"):
+    cmd, code_snippet = [p.decode("utf-8", errors="replace") for p in msg.split(b" ", 1)]
+    if cmd not in {"RUN", "RUN_PTY"}:
         if msg:
             print(f"Invalid command: {msg}")
         return
-
-    # Extract code snippet:
-    # if msg = b"RUN print('hello')", then code_snippet = "print('hello')"
-    # If msg = b"RUN", then code_snippet = "" (no code)
-    parts = msg.split(b" ", 1)
-    if len(parts) == 1:
-        code_snippet = ""
-    else:
-        code_snippet = parts[1].decode("utf-8", errors="replace")
 
     if not fds:
         print("No fds received or invalid fd.")
         return
 
-    slave_fd = fds[0]
-    if slave_fd < 0:
-        print("Invalid slave fd received.")
-        return
-
     pid = os.fork()
     if pid == 0:
-        run_child(slave_fd, code_snippet)
+        run_child(cmd, code_snippet, fds)
     else:
-        # parent
-        os.close(slave_fd)
-
-    try:
-        conn.sendall(b"OK")
-    except OSError as e:
-        print(f"Error sending OK to client: {e}")
+        for fd in fds:
+            os.close(fd)
+        try:
+            conn.sendall(f"OK {pid}".encode())
+        except OSError as e:
+            print(f"Error sending OK to client: {e}")
 
 
 def shutdown(server, server_pid):

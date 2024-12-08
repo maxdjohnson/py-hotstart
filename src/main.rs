@@ -8,11 +8,12 @@ use nix::sys::socket::{
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use nix::sys::termios::{tcgetattr, LocalFlags};
+use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{isatty, read, write, Pid};
 use std::env;
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::process::exit;
 
 const PIDFILE: &str = "/tmp/pyforked-server.pid";
@@ -28,16 +29,6 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let stdin_fd = stdin.as_fd();
-    let stdout_fd = stdout.as_fd();
-
-    // Check if stdin is a TTY
-    if !isatty(stdin_fd.as_raw_fd()).unwrap_or(false) {
-        return Err("stdin is not a tty; cannot inherit terminal information".into());
-    }
-
     // Parse arguments to obtain either `code_snippet` or `module_name`.
     let (code_snippet, module_name) = parse_arguments(env::args().skip(1))?;
 
@@ -58,15 +49,48 @@ fn run() -> Result<(), String> {
     let pid = read_pid_file(PIDFILE)?;
     ensure_process_alive(pid)?;
 
-    // Construct the message to send
-    let mut message = b"RUN".to_vec();
-    if !code_snippet.is_empty() {
-        message.push(b' ');
-        message.extend_from_slice(code_snippet.as_bytes());
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+
+    // Check if stdin is a TTY
+    if !isatty(stdin.as_raw_fd()).unwrap_or(false) {
+        run_notty(stdin.as_fd(), stdout.as_fd(), stderr.as_fd(), &code_snippet)
+    } else {
+        run_pty(stdin.as_fd(), stdout.as_fd(), &code_snippet)
+    }
+}
+
+/// Runs code in non-TTY mode by passing file descriptors directly to the forkserver
+fn run_notty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, stderr_fd: BorrowedFd<'_>, code_snippet: &str) -> Result<(), String> {
+    // Construct the request and send
+    let message = format!("RUN {}", code_snippet);
+    let fd_arr = [stdin_fd.as_raw_fd(), stdout_fd.as_raw_fd(), stderr_fd.as_raw_fd()];
+    let child_pid = forkserver_req(&message, &fd_arr)
+        .map_err(|e| format!("Failed to communicate with forkserver: {}", e))?;
+    // Wait for the child process to finish
+    let status = waitpid(Pid::from_raw(child_pid), None)
+        .map_err(|e| format!("Failed to wait for child process: {}", e))?;
+
+    match status {
+        WaitStatus::Exited(_, code) => {
+            if code != 0 {
+                return Err(format!("Child process exited with code {}", code));
+            }
+        }
+        WaitStatus::Signaled(_, signal, _) => {
+            return Err(format!("Child process terminated by signal {}", signal));
+        }
+        _ => return Err("Unexpected child process status".to_string()),
     }
 
+    Ok(())
+}
+
+/// Runs code inside a PTY and forwards input/output
+fn run_pty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, code_snippet: &str) -> Result<(), String> {
     // Get current terminal settings
-    let mut termios = tcgetattr(&stdin_fd)
+    let mut termios = tcgetattr(stdin_fd)
         .map_err(|e| format!("Failed to get terminal attributes: {}", e))?;
     termios.local_flags |= LocalFlags::ICANON;
 
@@ -78,42 +102,11 @@ fn run() -> Result<(), String> {
     let master_fd = pty.master;
     let slave_fd = pty.slave;
 
-    // Connect to the forkserver
-    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
-        .map_err(|e| format!("socket creation failed: {}", e))?;
-    let addr = UnixAddr::new(SERVER_ADDRESS).map_err(|e| format!("UnixAddr failed: {}", e))?;
-    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}", e))?;
-
-    // Send the slave_fd along with the message
+    // Construct the request and send
+    let message = format!("RUN_PTY {}", code_snippet);
     let fd_arr = [slave_fd.as_raw_fd()];
-    let cmsg = [ControlMessage::ScmRights(&fd_arr)];
-    let iov = [IoSlice::new(&message)];
-
-    nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-        .map_err(|e| format!("Failed to send message and fd to server: {}", e))?;
-
-    // Receive response from server
-    let mut buf = [0u8; 1024];
-    let response_size = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = nix::sys::socket::recvmsg::<()>(
-            fd.as_raw_fd(),
-            &mut iov,
-            None,
-            MsgFlags::empty(),
-        )
-        .map_err(|e| format!("Error receiving response from server: {}", e))?;
-
-        if msg.bytes == 0 {
-            return Err("Server disconnected prematurely (no data).".into());
-        }
-        msg.bytes
-    };
-
-    let response = &buf[..response_size];
-    if response != b"OK" {
-        return Err(format!("Server responded with invalid message: {:?}", response));
-    }
+    forkserver_req(&message, &fd_arr)
+        .map_err(|e| format!("Failed to communicate with forkserver: {}", e))?;
 
     // Close slave fd locally as we no longer need it
     drop(slave_fd);
@@ -179,6 +172,54 @@ fn run() -> Result<(), String> {
 
     eprintln!("CLI shutting down cleanly.");
     Ok(())
+}
+
+fn forkserver_req(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
+    // Connect to the forkserver
+    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
+        .map_err(|e| format!("socket creation failed: {}", e))?;
+    let addr = UnixAddr::new(SERVER_ADDRESS).map_err(|e| format!("UnixAddr failed: {}", e))?;
+    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}", e))?;
+
+    // Send the slave_fd along with the message
+    let cmsg = [ControlMessage::ScmRights(fd_arr)];
+    let iov = [IoSlice::new(command.as_bytes())];
+
+    nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+        .map_err(|e| format!("Failed to send message and fd to server: {}", e))?;
+
+    // Receive response from server
+    let mut buf = [0u8; 1024];
+    let response_size = {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let msg = nix::sys::socket::recvmsg::<()>(
+            fd.as_raw_fd(),
+            &mut iov,
+            None,
+            MsgFlags::empty(),
+        )
+        .map_err(|e| format!("Error receiving response from server: {}", e))?;
+
+        if msg.bytes == 0 {
+            return Err("Server disconnected prematurely (no data).".into());
+        }
+        msg.bytes
+    };
+
+    // Get response string
+    let response = &buf[..response_size];
+    let response_str = std::str::from_utf8(response)
+        .map_err(|_| "Server response was not valid UTF-8".to_string())?;
+
+    // Parse PID
+    let parts: Vec<&str> = response_str.split_whitespace().collect();
+    if parts.len() != 2 || parts[0] != "OK" {
+        return Err(format!("Server responded with invalid message: {:?}", response_str));
+    }
+    let pid = parts[1].parse::<i32>()
+        .map_err(|_| format!("Server responded with invalid PID: {}", parts[1]))?;
+
+    Ok(pid)
 }
 
 /// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
