@@ -1,18 +1,18 @@
 mod forkserver_client;
-use nix::unistd::{isatty, read, write, pipe, Pid};
-use std::process::exit;
 
-use nix::errno::Errno;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use signal_hook::flag;
-use nix::pty::openpty;
-use std::sync::Arc;
 use nix::Error;
+use nix::errno::Errno;
 use nix::libc;
+use nix::pty::openpty;
 use nix::sys::select::{pselect, FdSet};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
+use nix::unistd::{isatty, read, write, pipe};
+use signal_hook::flag;
 use std::env;
+use std::os::fd::{AsFd, AsRawFd};
+use std::process::exit;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 
@@ -134,17 +134,22 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
 
 fn run() -> Result<(), String> {
     // Parse arguments to obtain either `code_snippet` or `module_name`.
-    let (code_snippet, module_name) = parse_arguments(env::args().skip(1))?;
+    let (code_snippet, module_name, file_name) = parse_arguments(env::args().skip(1))?;
 
     // If a module name is provided, ignore the code snippet and run the module.
-    let code_snippet = if !module_name.is_empty() {
+    let code_snippet = if !file_name.is_empty() {
+        format!(
+            "import runpy; runpy.run_file('{}', run_name='__main__')",
+            module_name
+        )
+    } else if !module_name.is_empty() {
         format!(
             "import runpy; runpy.run_module('{}', run_name='__main__')",
             module_name
         )
     } else if code_snippet.is_empty() {
         // Default snippet: run a Python REPL
-        "import code; code.interact(local={})".to_string()
+        "import code; code.interact(local={}, exitmsg='')".to_string()
     } else {
         code_snippet
     };
@@ -221,9 +226,10 @@ fn run_pty(code_snippet: &str) -> Result<(), String> {
 }
 
 /// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
-fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String), String> {
+fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String, String), String> {
     let mut code_snippet = String::new();
     let mut module_name = String::new();
+    let mut file_name = String::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -238,12 +244,12 @@ fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, S
                     .ok_or("No module name provided after -m".to_string())?;
             }
             other => {
-                return Err(format!("Unknown argument: {}", other));
+                file_name = other.to_string();
             }
         }
     }
 
-    Ok((code_snippet, module_name))
+    Ok((code_snippet, module_name, file_name))
 }
 
 fn main() {

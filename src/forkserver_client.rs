@@ -1,20 +1,11 @@
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::ioctl_read;
-use nix::libc::{winsize, TIOCGWINSZ};
-use nix::pty::openpty;
-use nix::sys::select::{select, FdSet};
 use nix::sys::signal;
 use nix::sys::socket::{
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
-use nix::sys::termios::{tcgetattr, LocalFlags};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{isatty, read, write, pipe, Pid};
-use std::env;
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::process::exit;
+use std::os::fd::AsRawFd;
+use nix::unistd::Pid;
 
 const PIDFILE: &str = "/tmp/pyforked-server.pid";
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
