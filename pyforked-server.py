@@ -80,15 +80,21 @@ def run_child(cmd, code_snippet, fds):
             # We are meant to run in a pty. Set it as the controlling terminal.
             (slave_fd,) = fds
             fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            # Use the pty as fds 0-2
             os.dup2(slave_fd, 0)
             os.dup2(slave_fd, 1)
             os.dup2(slave_fd, 2)
+            # Close the original fd
             if slave_fd > 2:
                 os.close(slave_fd)
+            # Send SIGWINCH to update to new terminal state
+            os.kill(os.getpid(), signal.SIGWINCH)
         elif cmd == "RUN":
             # We are running outside a tty. Use the provided FDs
             for i in range(3):
                 os.dup2(fds[i], i)
+                if fds[i] > 2:
+                    os.close(fds[i])
             alive_fd = fds[3]
 
         # If no code snippet provided, just exit or do something default:

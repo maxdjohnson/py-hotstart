@@ -1,7 +1,9 @@
 mod forkserver_client;
+use nix::unistd::{isatty, read, write, pipe, Pid};
 use std::process::exit;
 
 use nix::errno::Errno;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use signal_hook::flag;
 use nix::pty::openpty;
 use std::sync::Arc;
@@ -10,9 +12,7 @@ use nix::libc;
 use nix::sys::select::{pselect, FdSet};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
-use nix::unistd::{read, write, Pid};
 use std::env;
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 
@@ -152,6 +152,38 @@ fn run() -> Result<(), String> {
     // Check forkserver status from PIDFILE
     forkserver_client::ensure_alive()?;
 
+    // Check if stdin is a TTY
+    if !isatty(std::io::stdin().as_raw_fd()).unwrap_or(false) {
+        run_notty(&code_snippet)
+    } else {
+        run_pty(&code_snippet)
+    }
+}
+
+/// Runs code in non-TTY mode by passing file descriptors directly to the forkserver
+fn run_notty(code_snippet: &str) -> Result<(), String> {
+    // Create a pipe for the child to indicate when it's done (waitpid doens't work on non-children)
+    let (read_fd, write_fd) = pipe().map_err(|e| format!("Failed to create pipe: {}", e))?;
+
+    // Construct the request and send
+    {
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let message = format!("RUN {}", code_snippet);
+        let fd_arr = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd(), write_fd.as_raw_fd()];
+        forkserver_client::request_fork(&message, &fd_arr)?;
+    }
+    drop(write_fd);
+
+    // Wait for EOF on read_fd indicating child closed
+    let mut buf = [0u8; 1];
+    while read(read_fd.as_raw_fd(), &mut buf).map_err(|e| format!("Failed to read from pipe: {}", e))? > 0 {}
+    Ok(())
+}
+
+/// Runs code inside a PTY and forwards input/output
+fn run_pty(code_snippet: &str) -> Result<(), String> {
     let original_winsize = get_winsize(std::io::stdin());
     let original_termios = match setup_terminal_raw() {
         Ok(t) => t,
