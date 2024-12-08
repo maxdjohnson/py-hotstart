@@ -32,15 +32,13 @@ fn main() {
     {
         let iov = [IoSlice::new(b"RUN")];
         let cmsg = [ControlMessage::ScmRights(&[slave_fd.as_raw_fd()])];
-        sendmsg(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-            .expect("sendmsg failed");
+        sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).expect("sendmsg failed");
     }
 
     // Receive response from server
     let mut buf = [0u8; 1024];
     let mut iov = [IoSliceMut::new(&mut buf)];
-    let msg = recvmsg(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty())
-        .expect("recvmsg failed");
+    let msg = recvmsg::<()>(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty()).expect("recvmsg failed");
     let response = &buf[..msg.bytes];
     if response != b"OK" {
         eprintln!("Server did not respond with OK");
