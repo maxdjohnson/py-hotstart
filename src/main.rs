@@ -7,7 +7,7 @@ use nix::sys::socket::{
     AddressFamily, UnixAddr, SockType, SockFlag, socket, connect,
     sendmsg, recvmsg, ControlMessage, MsgFlags,
 };
-use nix::unistd::{close, read, write};
+use nix::unistd::{read, write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::io::{IoSlice, IoSliceMut};
 use std::process::exit;
@@ -151,9 +151,7 @@ fn main() {
     }
 
     // Close slave fd locally
-    if let Err(e) = close(slave_fd.as_raw_fd()) {
-        eprintln!("close(slave_fd) failed: {}", e);
-    }
+    drop(slave_fd);
 
     // Set nonblocking
     set_nonblocking(stdin_borrowed.as_raw_fd());
@@ -225,10 +223,6 @@ fn main() {
             }
         }
     }
-
-    // Clean shutdown: close master_fd and server fd
-    let _ = close(master_fd.as_raw_fd());
-    let _ = close(fd.as_raw_fd());
 
     eprintln!("CLI shutting down cleanly.");
 }
