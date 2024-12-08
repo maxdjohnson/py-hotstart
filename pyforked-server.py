@@ -106,7 +106,10 @@ def run_child(cmd, code_snippet, fds):
         # Execute the provided code snippet
         # It's safer to exec in a controlled namespace.
         local_ns = {}
-        exec(code_snippet, {}, local_ns)
+        try:
+            exec(code_snippet, {}, local_ns)
+        except Exception:
+            traceback.print_exc()
     finally:
         if alive_fd is not None:
             os.close(alive_fd)

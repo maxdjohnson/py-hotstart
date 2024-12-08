@@ -139,8 +139,8 @@ fn run() -> Result<(), String> {
     // If a module name is provided, ignore the code snippet and run the module.
     let code_snippet = if !file_name.is_empty() {
         format!(
-            "import runpy; runpy.run_file('{}', run_name='__main__')",
-            module_name
+            "import runpy; runpy.run_path('{}', run_name='__main__')",
+            file_name
         )
     } else if !module_name.is_empty() {
         format!(
