@@ -6,7 +6,7 @@ use nix::sys::socket::{
     sendmsg, recvmsg, ControlMessage, MsgFlags,
 };
 use nix::unistd::{close, read, write};
-use std::os::fd::{OwnedFd, AsFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::io::{IoSlice, IoSliceMut};
 use std::process::exit;
 
@@ -15,13 +15,8 @@ fn main() {
 
     // Allocate pty locally
     let pty = openpty(None, None).expect("openpty failed");
-    let master_fd = pty.master; // RawFd
-    let slave_fd = pty.slave;   // RawFd
-
-    // Wrap master_fd in OwnedFd to later get BorrowedFd safely
-    // SAFETY: from_raw_fd is unsafe because we must ensure no other owner of this fd exists.
-    // openpty() gave us a new fd, so we're the unique owner here.
-    let master_owned = unsafe { OwnedFd::from_raw_fd(master_fd) };
+    let master_fd = pty.master;
+    let slave_fd = pty.slave;
 
     // Convert the standard input/output to BorrowedFd
     let stdin_borrowed = std::io::stdin().as_fd();
@@ -31,20 +26,20 @@ fn main() {
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
         .expect("socket failed");
     let addr = UnixAddr::new(server_path).expect("UnixAddr failed");
-    connect(fd, &addr).expect("connect failed");
+    connect(fd.as_raw_fd(), &addr).expect("connect failed");
 
     // Send slave_fd via SCM_RIGHTS
     {
         let iov = [IoSlice::new(b"RUN")];
-        let cmsg = [ControlMessage::ScmRights(&[slave_fd])];
-        sendmsg(fd, &iov, &cmsg, MsgFlags::empty(), None)
+        let cmsg = [ControlMessage::ScmRights(&[slave_fd.as_raw_fd()])];
+        sendmsg(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
             .expect("sendmsg failed");
     }
 
     // Receive response from server
     let mut buf = [0u8; 1024];
     let mut iov = [IoSliceMut::new(&mut buf)];
-    let msg = recvmsg(fd, &mut iov, None, MsgFlags::empty())
+    let msg = recvmsg(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty())
         .expect("recvmsg failed");
     let response = &buf[..msg.bytes];
     if response != b"OK" {
@@ -53,17 +48,17 @@ fn main() {
     }
 
     // Close slave fd locally
-    close(slave_fd).expect("close slave failed");
+    close(slave_fd.as_raw_fd()).expect("close slave failed");
 
     // Set nonblocking on stdin, stdout, and master
     set_nonblocking(stdin_borrowed.as_raw_fd());
     set_nonblocking(stdout_borrowed.as_raw_fd());
-    set_nonblocking(master_owned.as_fd().as_raw_fd());
+    set_nonblocking(master_fd.as_raw_fd());
 
     let mut buf_in = [0u8; 1024];
     let mut buf_out = [0u8; 1024];
 
-    let master_borrowed = master_owned.as_fd();
+    let master_borrowed = master_fd.as_fd();
 
     loop {
         let mut fds = FdSet::new();
@@ -85,7 +80,7 @@ fn main() {
         if fds.contains(stdin_borrowed) {
             match read(stdin_borrowed.as_raw_fd(), &mut buf_in) {
                 Ok(n) if n > 0 => {
-                    let _ = write(master_borrowed.as_raw_fd(), &buf_in[..n]);
+                    let _ = write(master_borrowed, &buf_in[..n]);
                 }
                 _ => {}
             }
@@ -94,7 +89,7 @@ fn main() {
         if fds.contains(master_borrowed) {
             match read(master_borrowed.as_raw_fd(), &mut buf_out) {
                 Ok(n) if n > 0 => {
-                    let _ = write(stdout_borrowed.as_raw_fd(), &buf_out[..n]);
+                    let _ = write(stdout_borrowed, &buf_out[..n]);
                 }
                 _ => {}
             }
