@@ -9,7 +9,7 @@ use nix::sys::socket::{
 };
 use nix::sys::termios::{tcgetattr, LocalFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{isatty, read, write, Pid};
+use nix::unistd::{isatty, read, write, pipe, Pid};
 use std::env;
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
@@ -63,27 +63,17 @@ fn run() -> Result<(), String> {
 
 /// Runs code in non-TTY mode by passing file descriptors directly to the forkserver
 fn run_notty(stdin_fd: BorrowedFd<'_>, stdout_fd: BorrowedFd<'_>, stderr_fd: BorrowedFd<'_>, code_snippet: &str) -> Result<(), String> {
+    // Create a pipe for the child to indicate when it's done (waitpid doens't work on non-children)
+    let (read_fd, write_fd) = pipe().map_err(|e| format!("Failed to create pipe: {}", e))?;
     // Construct the request and send
     let message = format!("RUN {}", code_snippet);
-    let fd_arr = [stdin_fd.as_raw_fd(), stdout_fd.as_raw_fd(), stderr_fd.as_raw_fd()];
-    let child_pid = forkserver_req(&message, &fd_arr)
+    let fd_arr = [stdin_fd.as_raw_fd(), stdout_fd.as_raw_fd(), stderr_fd.as_raw_fd(), write_fd.as_raw_fd()];
+    forkserver_req(&message, &fd_arr)
         .map_err(|e| format!("Failed to communicate with forkserver: {}", e))?;
-    // Wait for the child process to finish
-    let status = waitpid(Pid::from_raw(child_pid), None)
-        .map_err(|e| format!("Failed to wait for child process: {}", e))?;
-
-    match status {
-        WaitStatus::Exited(_, code) => {
-            if code != 0 {
-                return Err(format!("Child process exited with code {}", code));
-            }
-        }
-        WaitStatus::Signaled(_, signal, _) => {
-            return Err(format!("Child process terminated by signal {}", signal));
-        }
-        _ => return Err("Unexpected child process status".to_string()),
-    }
-
+    drop(write_fd);
+    // Wait for EOF on read_fd indicating child closed
+    let mut buf = [0u8; 1];
+    while read(read_fd.as_raw_fd(), &mut buf).map_err(|e| format!("Failed to read from pipe: {}", e))? > 0 {}
     Ok(())
 }
 

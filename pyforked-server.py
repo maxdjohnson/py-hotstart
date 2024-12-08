@@ -73,6 +73,7 @@ def recv_fds(conn, max_fds=1):
 
 def run_child(cmd, code_snippet, fds):
     # In the child:
+    alive_fd = None
     try:
         os.setsid()
         if cmd == "RUN_PTY":
@@ -88,6 +89,7 @@ def run_child(cmd, code_snippet, fds):
             # We are running outside a tty. Use the provided FDs
             for i in range(3):
                 os.dup2(fds[i], i)
+            alive_fd = fds[3]
 
         # If no code snippet provided, just exit or do something default:
         if not code_snippet.strip():
@@ -106,6 +108,8 @@ def run_child(cmd, code_snippet, fds):
     except BaseException:
         traceback.print_exc()
     finally:
+        if alive_fd is not None:
+            os.close(alive_fd)
         os._exit(0)
 
 
@@ -121,6 +125,7 @@ def handle_client(conn):
         print("No fds received or invalid fd.")
         return
 
+    print(f"Running {cmd=} {fds=}")
     pid = os.fork()
     if pid == 0:
         run_child(cmd, code_snippet, fds)
