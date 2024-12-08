@@ -1,5 +1,8 @@
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
+use nix::ioctl_read;
+use nix::libc::{winsize, TIOCGWINSZ};
+use nix::unistd::isatty;
 use nix::unistd::Pid;
 use nix::sys::signal;
 use nix::sys::select::{select, FdSet};
@@ -7,6 +10,7 @@ use nix::sys::socket::{
     AddressFamily, UnixAddr, SockType, SockFlag, socket, connect,
     sendmsg, recvmsg, ControlMessage, MsgFlags,
 };
+use nix::sys::termios::{tcgetattr, LocalFlags};
 use nix::unistd::{read, write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::io::{IoSlice, IoSliceMut};
@@ -16,8 +20,22 @@ use std::env;
 
 const PIDFILE: &str = "/tmp/pyforked-server.pid";
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
+const CTRL_D: u8 = 0x04;
+
+// Define the tiocgwinsz ioctl operation
+ioctl_read!(tiocgwinsz, TIOCGWINSZ, 0, winsize);
 
 fn main() {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_borrowed = stdin.as_fd();
+    let stdout_borrowed = stdout.as_fd();
+
+    // Check if stdin is a TTY
+    if !isatty(stdin.as_raw_fd()).unwrap_or(false) {
+        eprintln!("stdin is not a tty, cannot inherit terminfo");
+        std::process::exit(1);
+    }
     // Parse arguments
     // Supported:
     // -c code_snippet
@@ -95,15 +113,25 @@ fn main() {
         message.extend_from_slice(code_snippet.as_bytes());
     }
 
+    // Get current terminal attributes from CLI
+    let mut termios = match tcgetattr(&stdin) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to get terminal attributes: {}", e);
+            std::process::exit(1);
+        }
+    };
+    // Ensure canonical mode:
+    termios.local_flags |= LocalFlags::ICANON;
+
+    // Get current window size
+    let ws = get_winsize(&stdin);
+
     // Allocate pty locally
-    let pty = openpty(None, None).expect("openpty failed");
+    let pty = openpty(&ws, Some(&termios)).expect("openpty failed");
     let master_fd = pty.master;
     let slave_fd = pty.slave;
 
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let stdin_borrowed = stdin.as_fd();
-    let stdout_borrowed = stdout.as_fd();
 
     // Connect to forkserver
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
@@ -161,18 +189,14 @@ fn main() {
     let mut buf_in = [0u8; 1024];
     let mut buf_out = [0u8; 1024];
 
-    // Set up signal handling for clean shutdown using signal-hook
-    use signal_hook::consts::SIGINT;
-    use signal_hook::flag;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    let mut stdin_eof = false;
 
-    let running = Arc::new(AtomicBool::new(true));
-    flag::register(SIGINT, running.clone()).expect("Unable to register SIGINT handler");
-
-    while running.load(Ordering::SeqCst) {
+    loop {
         let mut fds = FdSet::new();
-        fds.insert(stdin_borrowed);
+        // Only listen on stdin if we haven't hit EOF yet
+        if !stdin_eof {
+            fds.insert(stdin_borrowed);
+        }
         fds.insert(master_fd.as_fd());
 
         let nfds = std::cmp::max(stdin_borrowed.as_raw_fd(), master_fd.as_raw_fd()) + 1;
@@ -182,8 +206,8 @@ fn main() {
             break;
         }
 
-        // If something happened on stdin
-        if fds.contains(stdin_borrowed) {
+        // If something happened on stdin and not EOF yet
+        if !stdin_eof && fds.contains(stdin_borrowed) {
             match read(stdin_borrowed.as_raw_fd(), &mut buf_in) {
                 Ok(n) if n > 0 => {
                     if !write_all(&master_fd.as_fd(), &buf_in[..n]) {
@@ -202,7 +226,6 @@ fn main() {
             }
         }
 
-        // If something happened on master fd
         if fds.contains(master_fd.as_fd()) {
             match read(master_fd.as_raw_fd(), &mut buf_out) {
                 Ok(n) if n > 0 => {
@@ -227,6 +250,23 @@ fn main() {
     eprintln!("CLI shutting down cleanly.");
 }
 
+fn get_winsize(fd: impl AsFd) -> Option<winsize> {
+    let mut ws = winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    // Use the generated ioctl function
+    let res = unsafe { tiocgwinsz(fd.as_fd().as_raw_fd(), &mut ws) };
+    if res.is_ok() {
+        Some(ws)
+    } else {
+        None
+    }
+}
+
 fn write_all(fd: &impl AsFd, mut data: &[u8]) -> bool {
     while !data.is_empty() {
         match write(fd, data) {
@@ -241,7 +281,7 @@ fn write_all(fd: &impl AsFd, mut data: &[u8]) -> bool {
                 // Handle write error
                 return false;
             }
-            _ => unreachable!(), // This covers all other Ok cases, like Ok(1_usize..)
+            _ => unreachable!(),
         }
     }
     true
