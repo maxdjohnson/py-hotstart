@@ -197,7 +197,9 @@ fn run_pty(code_snippet: &str) -> Result<(), String> {
     };
 
     // Spawn child and attach to slave pty
-    if let Err(e) = attach_child_wrapper(&code_snippet, &slave) {
+    let message = format!("RUN_PTY {}", code_snippet);
+    let fd_arr = [slave.as_raw_fd()];
+    if let Err(e) = forkserver_client::request_fork(&message, &fd_arr) {
         eprintln!("Unable to request fork: {}", e);
         std::process::exit(1);
     }
@@ -249,11 +251,4 @@ fn main() {
         eprintln!("Error: {}", e);
         exit(1);
     }
-}
-
-fn attach_child_wrapper(code_snippet: &str, fd: &impl AsRawFd) -> Result<(), String> {
-    let message = format!("RUN_PTY {}", code_snippet);
-    let fd_arr = [fd.as_raw_fd()];
-    forkserver_client::request_fork(&message, &fd_arr)?;
-    Ok(())
 }
