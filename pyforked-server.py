@@ -42,8 +42,14 @@ def daemonize():
 
 
 def write_pidfile(pid):
-    with open(PIDFILE, "w") as f:
+    tmp_pidfile = PIDFILE + ".tmp"
+    with open(tmp_pidfile, "w") as f:
         f.write(str(pid))
+    try:
+        os.rename(tmp_pidfile, PIDFILE)
+    except FileExistsError:
+        os.unlink(tmp_pidfile)
+        raise OSError(f"PID file {PIDFILE} already exists")
 
 
 def remove_pidfile():

@@ -134,7 +134,10 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> nix::Result<()> {
 
 fn run() -> Result<(), String> {
     // Parse arguments to obtain either `code_snippet` or `module_name`.
-    let (code_snippet, module_name, file_name) = parse_arguments(env::args().skip(1))?;
+    let (code_snippet, module_name, file_name, start_with_imports) = parse_arguments(env::args().skip(1))?;
+    if !start_with_imports.is_empty() {
+        return forkserver_client::start(&start_with_imports);
+    }
 
     // If a module name is provided, ignore the code snippet and run the module.
     let code_snippet = if !file_name.is_empty() {
@@ -155,7 +158,9 @@ fn run() -> Result<(), String> {
     };
 
     // Check forkserver status from PIDFILE
-    forkserver_client::ensure_alive()?;
+    if !forkserver_client::is_alive()? {
+        return Err("server not running. start the server with pyforked -i".into());
+    }
 
     // Check if stdin is a TTY
     if !isatty(std::io::stdin().as_raw_fd()).unwrap_or(false) {
@@ -226,10 +231,11 @@ fn run_pty(code_snippet: &str) -> Result<(), String> {
 }
 
 /// Parse command-line arguments, extracting either `-c code_snippet` or `-m module_name`.
-fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String, String), String> {
+fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String, String, String), String> {
     let mut code_snippet = String::new();
     let mut module_name = String::new();
     let mut file_name = String::new();
+    let mut start_with_imports = String::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -243,13 +249,19 @@ fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, S
                     .next()
                     .ok_or("No module name provided after -m".to_string())?;
             }
+            "-i" => {
+                let import_value = args
+                    .next()
+                    .ok_or("No import value provided after -i".to_string())?;
+                start_with_imports = import_value
+            }
             other => {
                 file_name = other.to_string();
             }
         }
     }
 
-    Ok((code_snippet, module_name, file_name))
+    Ok((code_snippet, module_name, file_name, start_with_imports))
 }
 
 fn main() {

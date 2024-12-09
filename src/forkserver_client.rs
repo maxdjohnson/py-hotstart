@@ -1,4 +1,5 @@
 use nix::sys::signal;
+use std::process::Command;
 use nix::sys::socket::{
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
@@ -9,6 +10,92 @@ use nix::unistd::Pid;
 
 const PIDFILE: &str = "/tmp/pyforked-server.pid";
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
+const SCRIPT: &str = include_str!("../pyforked-server.py");
+
+
+pub fn start(prelude: &str) -> Result<(), String> {
+    // Read PID file if it exists
+    if let Some(pid) = read_pid_file(PIDFILE)? {
+        if let Err(err) = signal::kill(Pid::from_raw(pid), signal::Signal::SIGTERM) {
+            if err != nix::errno::Errno::ESRCH {
+                return Err(format!("Failed to kill process: {}", err));
+            }
+        } else {
+            // The process is alive, and we successfully sent SIGKILL. Wait for pidfile to be removed
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(1) {
+                if !std::path::Path::new(PIDFILE).exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            // If the pidfile still exists after 1s, force kill the process
+            if let Err(err) = signal::kill(Pid::from_raw(pid), signal::Signal::SIGKILL) {
+                if err != nix::errno::Errno::ESRCH {
+                    return Err(format!("Failed to kill process: {}", err));
+                }
+            }
+        }
+        // Rm the pidfile
+        if let Err(e) = fs::remove_file(PIDFILE) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("Failed to remove pidfile: {}", e));
+            }
+        }
+    }
+    // Write the server script to a temporary file
+    fs::write("/tmp/pyforked-server.py", format!("{}\n{}", prelude, SCRIPT))
+        .map_err(|e| format!("Failed to write server script: {}", e))?;
+
+    // Launch the process and wait for it to exit
+    let output = Command::new("python3")
+        .arg("/tmp/pyforked-server.py")
+        .output()
+        .map_err(|e| format!("Failed to launch process: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Server failed to start: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    // Wait for pidfile and socket to be created
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(60) {
+        if std::path::Path::new(PIDFILE).exists() && std::path::Path::new(SERVER_ADDRESS).exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !std::path::Path::new(PIDFILE).exists() {
+        return Err("Timed out waiting for server to start".into());
+    }
+    Ok(())
+}
+
+pub fn is_alive() -> Result<bool, String> {
+    if let Some(pid) = read_pid_file(PIDFILE)? {
+        if pid_is_alive(pid)? {
+            return Ok(true)
+        }
+    }
+    Ok(false)
+}
+
+/// Ensure that the given PID corresponds to a currently running process.
+fn pid_is_alive(pid: i32) -> Result<bool, String> {
+    if let Err(err) = signal::kill(Pid::from_raw(pid), None) {
+        if err == nix::errno::Errno::ESRCH {
+            return Ok(false);
+        } else {
+            return Err(format!("Failed to check process status: {}", err));
+        }
+    }
+    Ok(true)
+}
 
 // Make a request to the forkserver, returning the pid of the new process.
 pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
@@ -59,29 +146,16 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
     Ok(pid)
 }
 
-/// Ensure that the given PID corresponds to a currently running process.
-pub fn ensure_alive() -> Result<(), String> {
-    let pid = read_pid_file(PIDFILE)?;
-    if let Err(err) = signal::kill(Pid::from_raw(pid), None) {
-        if err == nix::errno::Errno::ESRCH {
-            return Err(format!(
-                "No process with pid {} is alive. The forkserver might have crashed. Please restart it.",
-                pid
-            ));
-        } else {
-            return Err(format!("Failed to check process status: {}", err));
-        }
-    }
-    Ok(())
-}
-
 /// Read the PID from the given pidfile and return it.
-fn read_pid_file(path: &str) -> Result<i32, String> {
-    let pid_str = fs::read_to_string(path).map_err(|_| {
-        "Forkserver not running (no pidfile). Please start it first.".to_string()
-    })?;
+fn read_pid_file(path: &str) -> Result<Option<i32>, String> {
+    let pid_str = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Error reading pidfile".to_string()),
+    };
     pid_str
         .trim()
         .parse::<i32>()
         .map_err(|_| "Invalid PID in pidfile".to_string())
+        .map(Some)
 }
