@@ -89,7 +89,11 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> Result<()> {
         readfds.insert(stdin_fd);
         readfds.insert(pty_fd.as_fd());
 
-        pselect(None, &mut readfds, None, None, None, &sigmask_empty).context("pselect failed")?;
+        match pselect(None, &mut readfds, None, None, None, &sigmask_empty) {
+            Ok(_) => (),
+            Err(nix::Error::EINTR) => continue,
+            Err(e) => return Err(anyhow!("pselect failed: {}", e)),
+        }
 
         if readfds.contains(stdin_fd) {
             match read(stdin_fd.as_raw_fd(), &mut buf) {
