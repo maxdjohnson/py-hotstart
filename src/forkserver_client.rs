@@ -25,16 +25,16 @@ pub fn start(prelude: &str) -> Result<()> {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // If the socket still exists after 1s, delete it
-        if std::path::Path::new(SERVER_ADDRESS).exists() {
-            eprintln!(
-                "pyforked-server.py failed to clean up sock {}",
-                SERVER_ADDRESS
-            );
-            if let Err(e) = fs::remove_file(SERVER_ADDRESS) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(anyhow!("Failed to remove sock {}: {}", SERVER_ADDRESS, e));
-                }
+    }
+    // If the socket still exists after 1s, delete it
+    if std::path::Path::new(SERVER_ADDRESS).exists() {
+        eprintln!(
+            "pyforked-server.py failed to clean up sock {}",
+            SERVER_ADDRESS
+        );
+        if let Err(e) = fs::remove_file(SERVER_ADDRESS) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow!("Failed to remove sock {}: {}", SERVER_ADDRESS, e));
             }
         }
     }
