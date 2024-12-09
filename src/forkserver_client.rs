@@ -1,5 +1,11 @@
 use std::process::Command;
+use nix::unistd::dup;
+use nix::pty::openpty;
+use std::os::unix::io::FromRawFd;
+use nix::sys::termios::tcgetattr;
+use std::io::Read;
 use nix::sys::socket::{
+
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use std::fs;
@@ -35,17 +41,40 @@ pub fn start(prelude: &str) -> Result<(), String> {
     fs::write("/tmp/pyforked-server.py", format!("{}\n{}", prelude, SCRIPT))
         .map_err(|e| format!("Failed to write server script: {}", e))?;
 
-    // Launch the process and wait for it to exit
-    let output = Command::new("python3")
-        .arg("/tmp/pyforked-server.py")
-        .output()
-        .map_err(|e| format!("Failed to launch process: {}", e))?;
+    // Use openpty to obtain master/slave fds
+    let termios = tcgetattr(std::io::stdin()).ok();
+    let (master, slave) = openpty(None, &termios)
+        .map(|p| (p.master, p.slave))
+        .map_err(|e| format!("Unable to allocate pty: {}", e))?;
 
-    if !output.status.success() {
+    let stdin_fd = dup(slave.as_raw_fd()).map_err(|e| format!("Failed to dup stdin_fd: {}", e))?;
+    let stdout_fd = dup(slave.as_raw_fd()).map_err(|e| format!("Failed to dup stdout_fd: {}", e))?;
+    let stderr_fd = dup(slave.as_raw_fd()).map_err(|e| format!("Failed to dup stderr_fd: {}", e))?;
+
+    // Run forkserver with pty
+    let mut child = Command::new("python3")
+        .arg("/tmp/pyforked-server.py")
+        .stdin(unsafe { std::process::Stdio::from_raw_fd(stdin_fd)})
+        .stdout(unsafe { std::process::Stdio::from_raw_fd(stdout_fd)})
+        .stderr(unsafe { std::process::Stdio::from_raw_fd(stderr_fd)})
+        .spawn()
+        .map_err(|e| format!("Failed to spawn process: {}", e))?;
+
+    // Drop the slave side of the pty
+    drop(slave);
+
+    // Read master side of pty until EOF (child exits)
+    let mut output = String::new();
+    let mut master_file: std::fs::File = master.into();
+    master_file.read_to_string(&mut output).map_err(|e| format!("Failed to read from master: {}", e))?;
+
+    // Wait for the child to finish if needed
+    let status = child.wait().map_err(|e| format!("Failed to wait for child process: {}", e))?;
+    if !status.success() {
         return Err(format!(
             "Server failed to start: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            status,
+            output,
         ));
     }
 
