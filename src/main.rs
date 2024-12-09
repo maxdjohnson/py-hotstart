@@ -32,16 +32,6 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
     Ok(())
 }
 
-fn setup_terminal_raw() -> Result<Termios> {
-    let mut termios =
-        tcgetattr(std::io::stdin().as_fd()).context("Failed to get terminal attributes")?;
-    let saved = termios.clone();
-    cfmakeraw(&mut termios);
-    tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &termios)
-        .context("Failed to set terminal attributes to raw mode")?;
-    Ok(saved)
-}
-
 fn get_winsize(fd: impl AsRawFd) -> Option<libc::winsize> {
     let mut ws = libc::winsize {
         ws_row: 0,
@@ -198,9 +188,16 @@ impl Drop for TermiosGuard {
 
 fn run_pty(code_snippet: &str) -> Result<()> {
     let original_winsize = get_winsize(std::io::stdin());
-    let original_termios = setup_terminal_raw()
-        .map(|t| TermiosGuard { original: t })
-        .context("Unable to set terminal attributes")?;
+
+    // Temporarily configure the terminal to raw. TermiosGuard will restore the original settings at exit.
+    let mut termios =
+        tcgetattr(std::io::stdin().as_fd()).context("Failed to get terminal attributes")?;
+    let original_termios = TermiosGuard {
+        original: termios.clone(),
+    };
+    cfmakeraw(&mut termios);
+    tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &termios)
+        .context("Failed to set terminal attributes to raw mode")?;
 
     let (master, slave) = openpty(&original_winsize, Some(&original_termios.original))
         .map(|p| (p.master, p.slave))
