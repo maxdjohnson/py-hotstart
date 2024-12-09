@@ -9,7 +9,6 @@ import traceback
 
 SERVER_ADDRESS = "/tmp/pyforked-server.sock"
 LOG_PATH = os.path.expanduser("~/Library/Logs/pyforked-server.log")
-PIDFILE = "/tmp/pyforked-server.pid"
 MAXFD = 2048
 
 
@@ -41,22 +40,6 @@ def daemonize():
         os.close(log_fd)
 
 
-def write_pidfile(pid):
-    tmp_pidfile = PIDFILE + ".tmp"
-    with open(tmp_pidfile, "w") as f:
-        f.write(str(pid))
-    try:
-        os.rename(tmp_pidfile, PIDFILE)
-    except FileExistsError:
-        os.unlink(tmp_pidfile)
-        raise OSError(f"PID file {PIDFILE} already exists")
-
-
-def remove_pidfile():
-    if os.path.exists(PIDFILE):
-        os.remove(PIDFILE)
-
-
 def recv_fds(conn, max_fds=1):
     buf = bytearray(1024)
     fds = array.array("i", [-1] * max_fds)
@@ -77,7 +60,7 @@ def recv_fds(conn, max_fds=1):
     return data, out_fds
 
 
-def run_child(cmd, code_snippet, fds):
+def run_child_then_exit(cmd, code_snippet, fds):
     # In the child:
     alive_fd = None
     try:
@@ -139,44 +122,48 @@ def shutdown(server, server_pid):
     if os.getpid() != server_pid:
         # This is not the original parent process; do not remove pidfile.
         return
-    print("Received shutdown signal, terminating forkserver.")
     server.close()
-    if os.path.exists(SERVER_ADDRESS):
+    try:
         os.unlink(SERVER_ADDRESS)
-    remove_pidfile()
-    os._exit(0)
+    except Exception:
+        traceback.print_exc()
 
 
 def run_forkserver():
     server_pid = os.getpid()
 
-    if os.path.exists(SERVER_ADDRESS):
-        os.unlink(SERVER_ADDRESS)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SERVER_ADDRESS)
     server.listen(5)
     print(f"Server listening on {SERVER_ADDRESS}")
 
     # Handle signals for clean shutdown
-    def handle_shutdown(signum, frame):
+    def handle_sigterm(signum, frame):
+        print("Received shutdown signal, terminating forkserver.")
         shutdown(server, server_pid)
+        os._exit(0)
 
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGCHLD, handle_sigchld)
+    default_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
+    default_sigint = signal.signal(signal.SIGINT, handle_sigterm)
+    default_sigchld = signal.signal(signal.SIGCHLD, handle_sigchld)
 
-    write_pidfile(server_pid)
+    try:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError as e:
+                print(f"Error on accept: {e}")
+                continue
 
-    while True:
-        try:
-            conn, _ = server.accept()
-        except OSError as e:
-            print(f"Error on accept: {e}")
-            continue
-
-        with conn:
             try:
                 msg, fds = recv_fds(conn)
+
+                # Handle EXIT message by breaking out of the loop
+                if msg == "EXIT":
+                    assert not fds, "unexpected file descriptors"
+                    break
+
+                # Parse and validate command
                 cmd, code_snippet = [
                     p.decode("utf-8", errors="replace") for p in msg.split(b" ", 1)
                 ]
@@ -185,29 +172,38 @@ def run_forkserver():
                         print(f"Invalid command: {msg}")
                     continue
 
-                if not fds:
-                    print("No fds received or invalid fd.")
-                    continue
-
-                print(f"Running {cmd=} {fds=}")
+                # Fork; child runs command while server acks
+                print(f"Running {cmd=} {code_snippet=} {fds=}")
                 pid = os.fork()
                 if pid == 0:
+                    # Clean up server resources and reset signal handlers
                     conn.close()
+                    signal.signal(signal.SIGTERM, default_sigterm)
+                    signal.signal(signal.SIGINT, default_sigint)
+                    signal.signal(signal.SIGCHLD, default_sigchld)
                     server.close()
-                    run_child(cmd, code_snippet, fds)
+                    # Run child, then exit immeditatly without cleanup
+                    run_child_then_exit(cmd, code_snippet, fds)
                 else:
+                    # Close the fds that got copied to child
                     for fd in fds:
                         os.close(fd)
                     try:
                         conn.sendall(f"OK {pid}".encode())
                     except OSError as e:
                         print(f"Error sending OK to client: {e}")
-                    conn.close()
             except Exception:
                 traceback.print_exc()
+            finally:
+                conn.close()
+    finally:
+        print("Received EXIT command, terminating forkserver.")
+        shutdown(server, server_pid)
 
 
 def main():
+    if os.path.exists(SERVER_ADDRESS):
+        raise ValueError(f"File {SERVER_ADDRESS} already exists")
     try:
         daemonize()
         run_forkserver()
