@@ -1,4 +1,4 @@
-mod forkserver_client;
+mod pyhotstart;
 
 use anyhow::{anyhow, Context, Result};
 use nix::errno::Errno;
@@ -119,7 +119,7 @@ fn run() -> Result<()> {
     let (code_snippet, module_name, file_name, start_with_imports) =
         parse_arguments(env::args().skip(1))?;
     if !start_with_imports.is_empty() {
-        return forkserver_client::start(&start_with_imports);
+        return pyhotstart::start_server(&start_with_imports);
     }
 
     let code_snippet = if !file_name.is_empty() {
@@ -159,7 +159,7 @@ fn run_notty(code_snippet: &str) -> Result<()> {
             stderr.as_raw_fd(),
             write_fd.as_raw_fd(),
         ];
-        forkserver_client::request_fork(&message, &fd_arr)?;
+        pyhotstart::request_fork(&message, &fd_arr)?;
     }
     drop(write_fd);
 
@@ -209,7 +209,7 @@ fn run_pty(code_snippet: &str) -> Result<()> {
 
     let message = format!("RUN_PTY {}", code_snippet);
     let fd_arr = [slave.as_raw_fd()];
-    forkserver_client::request_fork(&message, &fd_arr)?;
+    pyhotstart::request_fork(&message, &fd_arr)?;
     drop(slave);
 
     if let Err(e) = do_proxy(&master) {

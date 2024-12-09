@@ -12,10 +12,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::process::Command;
 
-const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
-const SCRIPT: &str = include_str!("../pyforked-server.py");
+const SERVER_ADDRESS: &str = "/tmp/pyhotstart.sock";
+const SCRIPT: &str = include_str!("./pyhotstart.py");
 
-pub fn start(prelude: &str) -> Result<()> {
+pub fn start_server(prelude: &str) -> Result<()> {
     if send_exit_message()? {
         // The process is alive, and we successfully sent EXIT. Wait for socket file to be removed.
         let start = std::time::Instant::now();
@@ -29,7 +29,7 @@ pub fn start(prelude: &str) -> Result<()> {
     // If the socket still exists after 1s, delete it
     if std::path::Path::new(SERVER_ADDRESS).exists() {
         eprintln!(
-            "pyforked-server.py failed to clean up sock {}",
+            "pyhotstart.py failed to clean up sock {}",
             SERVER_ADDRESS
         );
         if let Err(e) = fs::remove_file(SERVER_ADDRESS) {
@@ -40,7 +40,7 @@ pub fn start(prelude: &str) -> Result<()> {
     }
 
     fs::write(
-        "/tmp/pyforked-server.py",
+        "/tmp/pyhotstart.py",
         format!("{}\n{}", prelude, SCRIPT),
     )
     .context("Failed to write server script")?;
@@ -55,7 +55,7 @@ pub fn start(prelude: &str) -> Result<()> {
     let stderr_fd = dup(slave.as_raw_fd()).context("Failed to dup stderr_fd")?;
 
     let mut child = Command::new("python3")
-        .arg("/tmp/pyforked-server.py")
+        .arg("/tmp/pyhotstart.py")
         .stdin(unsafe { std::process::Stdio::from_raw_fd(stdin_fd) })
         .stdout(unsafe { std::process::Stdio::from_raw_fd(stdout_fd) })
         .stderr(unsafe { std::process::Stdio::from_raw_fd(stderr_fd) })
@@ -126,7 +126,7 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
     let addr = UnixAddr::new(SERVER_ADDRESS).context("UnixAddr failed")?;
     connect(fd.as_raw_fd(), &addr).map_err(|e| {
         anyhow!(
-            "Unable to connect to forkserver: {}\nStart the server with pyforked -i",
+            "Unable to connect to forkserver: {}\nStart the server with py-hotstart -i",
             e
         )
     })?;

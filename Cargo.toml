@@ -1,5 +1,5 @@
 [package]
-name = "pyforked"
+name = "py-hotstart"
 version = "0.1.0"
 edition = "2021"
 

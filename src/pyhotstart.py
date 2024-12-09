@@ -7,8 +7,8 @@ import socket
 import termios
 import traceback
 
-SERVER_ADDRESS = "/tmp/pyforked-server.sock"
-LOG_PATH = os.path.expanduser("~/Library/Logs/pyforked-server.log")
+SERVER_ADDRESS = "/tmp/pyhotstart.sock"
+LOG_PATH = os.path.expanduser("~/Library/Logs/pyhotstart.log")
 MAXFD = 2048
 
 
