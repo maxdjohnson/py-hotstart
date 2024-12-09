@@ -155,6 +155,7 @@ def run_forkserver():
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SERVER_ADDRESS)
     server.listen(5)
+    print(f"Server listening on {SERVER_ADDRESS}")
 
     # Handle signals for clean shutdown
     def handle_signal(signum, frame):
