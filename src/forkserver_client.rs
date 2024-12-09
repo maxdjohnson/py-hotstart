@@ -1,4 +1,3 @@
-use nix::sys::signal;
 use std::process::Command;
 use nix::sys::socket::{
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
@@ -6,7 +5,6 @@ use nix::sys::socket::{
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::AsRawFd;
-use nix::unistd::Pid;
 
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
 const SCRIPT: &str = include_str!("../pyforked-server.py");
@@ -81,7 +79,7 @@ pub fn send_exit_message() -> Result<bool, String> {
     // Send the "EXIT" message
     let message = "EXIT";
     let iov = [IoSlice::new(message.as_bytes())];
-    if let Err(_) = nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None) {
+    if nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).is_err() {
         return Ok(false);
     }
 
@@ -136,18 +134,4 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
         .map_err(|_| format!("Server responded with invalid PID: {}", parts[1]))?;
 
     Ok(pid)
-}
-
-/// Read the PID from the given pidfile and return it.
-fn read_pid_file(path: &str) -> Result<Option<i32>, String> {
-    let pid_str = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("Error reading pidfile".to_string()),
-    };
-    pid_str
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| "Invalid PID in pidfile".to_string())
-        .map(Some)
 }

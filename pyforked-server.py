@@ -159,7 +159,7 @@ def run_forkserver():
                 msg, fds = recv_fds(conn)
 
                 # Handle EXIT message by breaking out of the loop
-                if msg == "EXIT":
+                if msg.decode("utf-8", errors="replace") == "EXIT":
                     assert not fds, "unexpected file descriptors"
                     break
 
