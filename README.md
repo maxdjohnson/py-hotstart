@@ -42,3 +42,7 @@ Subsequent commands after the initial -i call will execute rapidly.
 2. Build with `cargo build --release`
 3. Place the binary (`target/release/py-hotstart`) in your PATH.
 4. Initialize the fork server with `py-hotstart -i "import your_heavy_dependency"` before running commands.
+
+## License
+
+MIT
