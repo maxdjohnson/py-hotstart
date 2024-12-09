@@ -8,39 +8,28 @@ use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::AsRawFd;
 use nix::unistd::Pid;
 
-const PIDFILE: &str = "/tmp/pyforked-server.pid";
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
 const SCRIPT: &str = include_str!("../pyforked-server.py");
 
 
 pub fn start(prelude: &str) -> Result<(), String> {
     // Read PID file if it exists
-    if let Some(pid) = read_pid_file(PIDFILE)? {
-        if let Err(err) = signal::kill(Pid::from_raw(pid), signal::Signal::SIGTERM) {
-            if err != nix::errno::Errno::ESRCH {
-                return Err(format!("Failed to kill process: {}", err));
+    if send_exit_message()? {
+        // The process is alive, and we successfully sent EXIT. Wait for socket file to be removed.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            if !std::path::Path::new(SERVER_ADDRESS).exists() {
+                break;
             }
-        } else {
-            // The process is alive, and we successfully sent SIGKILL. Wait for pidfile to be removed
-            let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_secs(1) {
-                if !std::path::Path::new(PIDFILE).exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-
-            // If the pidfile still exists after 1s, force kill the process
-            if let Err(err) = signal::kill(Pid::from_raw(pid), signal::Signal::SIGKILL) {
-                if err != nix::errno::Errno::ESRCH {
-                    return Err(format!("Failed to kill process: {}", err));
-                }
-            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // Rm the pidfile
-        if let Err(e) = fs::remove_file(PIDFILE) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("Failed to remove pidfile: {}", e));
+        // If the socket still exists after 1s, delete it
+        if std::path::Path::new(SERVER_ADDRESS).exists() {
+            eprintln!("pyforked-server.py failed to clean up sock {}", SERVER_ADDRESS);
+            if let Err(e) = fs::remove_file(SERVER_ADDRESS) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("Failed to remove sock {}: {}", SERVER_ADDRESS, e));
+                }
             }
         }
     }
@@ -62,40 +51,43 @@ pub fn start(prelude: &str) -> Result<(), String> {
         ));
     }
 
-    // Wait for pidfile and socket to be created
+    // Wait for socket to be created
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(60) {
-        if std::path::Path::new(PIDFILE).exists() && std::path::Path::new(SERVER_ADDRESS).exists() {
+        if std::path::Path::new(SERVER_ADDRESS).exists() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if !std::path::Path::new(PIDFILE).exists() {
+    if !std::path::Path::new(SERVER_ADDRESS).exists() {
         return Err("Timed out waiting for server to start".into());
     }
     Ok(())
 }
 
-pub fn is_alive() -> Result<bool, String> {
-    if let Some(pid) = read_pid_file(PIDFILE)? {
-        if pid_is_alive(pid)? {
-            return Ok(true)
-        }
-    }
-    Ok(false)
-}
 
-/// Ensure that the given PID corresponds to a currently running process.
-fn pid_is_alive(pid: i32) -> Result<bool, String> {
-    if let Err(err) = signal::kill(Pid::from_raw(pid), None) {
-        if err == nix::errno::Errno::ESRCH {
-            return Ok(false);
-        } else {
-            return Err(format!("Failed to check process status: {}", err));
-        }
+pub fn send_exit_message() -> Result<bool, String> {
+    // Try to connect to the forkserver
+    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
+        .map_err(|e| format!("socket creation failed: {}", e))?;
+    let addr = match UnixAddr::new(SERVER_ADDRESS) {
+        Ok(addr) => addr,
+        Err(_) => return Ok(false),
+    };
+    if let Err(_) = connect(fd.as_raw_fd(), &addr) {
+        return Ok(false);
     }
+
+    // Send the "EXIT" message
+    let message = "EXIT";
+    let iov = [IoSlice::new(message.as_bytes())];
+    if let Err(_) = nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None) {
+        return Ok(false);
+    }
+
     Ok(true)
 }
+
 
 // Make a request to the forkserver, returning the pid of the new process.
 pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
@@ -103,7 +95,7 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32, String> {
     let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
         .map_err(|e| format!("socket creation failed: {}", e))?;
     let addr = UnixAddr::new(SERVER_ADDRESS).map_err(|e| format!("UnixAddr failed: {}", e))?;
-    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}", e))?;
+    connect(fd.as_raw_fd(), &addr).map_err(|e| format!("Unable to connect to forkserver: {}\nStart the server with pyforked -i", e))?;
 
     // Send the slave_fd along with the message
     let cmsg = [ControlMessage::ScmRights(fd_arr)];

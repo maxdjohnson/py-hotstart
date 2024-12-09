@@ -11,7 +11,6 @@ use nix::unistd::{isatty, read, write, pipe};
 use signal_hook::flag;
 use std::env;
 use std::os::fd::{AsFd, AsRawFd};
-use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,12 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
-
-fn die(msg: &str) -> ! {
-    eprintln!("[!] {}", msg);
-    std::process::exit(1);
-}
-
 
 fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), Error> {
     while !buf.is_empty() {
@@ -39,7 +32,6 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
-
 
 fn setup_terminal_raw() -> nix::Result<Termios> {
     let mut termios = tcgetattr(std::io::stdin().as_fd())?;
@@ -157,11 +149,6 @@ fn run() -> Result<(), String> {
         code_snippet
     };
 
-    // Check forkserver status from PIDFILE
-    if !forkserver_client::is_alive()? {
-        return Err("server not running. start the server with pyforked -i".into());
-    }
-
     // Check if stdin is a TTY
     if !isatty(std::io::stdin().as_raw_fd()).unwrap_or(false) {
         run_notty(&code_snippet)
@@ -192,40 +179,45 @@ fn run_notty(code_snippet: &str) -> Result<(), String> {
     Ok(())
 }
 
+struct TermiosGuard {
+    original: Termios,
+}
+
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        // Attempt to restore the original termios
+        loop {
+            match tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &self.original) {
+                Ok(_) => break,
+                Err(Error::EINTR) => continue,
+                Err(e) => {
+                    eprintln!("Failed to restore terminal attributes: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Runs code inside a PTY and forwards input/output
 fn run_pty(code_snippet: &str) -> Result<(), String> {
     let original_winsize = get_winsize(std::io::stdin());
-    let original_termios = match setup_terminal_raw() {
-        Ok(t) => t,
-        Err(e) => die(&format!("Unable to set terminal attributes: {}", e)),
-    };
+    let original_termios = setup_terminal_raw().map(|t| TermiosGuard { original: t })
+        .map_err(|e| format!("Unable to set terminal attributes: {}", e))?;
 
     // Use openpty to obtain master/slave fds
-    let (master, slave) = match openpty(&original_winsize, Some(&original_termios)) {
-        Ok(p) => (p.master, p.slave),
-        Err(e) => die(&format!("Unable to allocate pty: {}", e)),
-    };
+    let (master, slave) = openpty(&original_winsize, Some(&original_termios.original))
+        .map(|p| (p.master, p.slave))
+        .map_err(|e| format!("Unable to allocate pty: {}", e))?;
 
     // Spawn child and attach to slave pty
     let message = format!("RUN_PTY {}", code_snippet);
     let fd_arr = [slave.as_raw_fd()];
-    if let Err(e) = forkserver_client::request_fork(&message, &fd_arr) {
-        eprintln!("Unable to request fork: {}", e);
-        std::process::exit(1);
-    }
+    forkserver_client::request_fork(&message, &fd_arr)?;
     drop(slave);
 
     if let Err(e) = do_proxy(&master) {
         eprintln!("Error in do_proxy: {}", e);
-    }
-
-    // Restore terminal attributes
-    loop {
-        match tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &original_termios) {
-            Ok(_) => break,
-            Err(Error::EINTR) => continue,
-            Err(e) => die(&format!("Unable to tcsetattr: {}", e)),
-        }
     }
     Ok(())
 }
@@ -267,6 +259,6 @@ fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, S
 fn main() {
     if let Err(e) = run() {
         eprintln!("Error: {}", e);
-        exit(1);
+        std::process::exit(1);
     }
 }
