@@ -7,12 +7,12 @@ use nix::pty::openpty;
 use nix::sys::select::{pselect, FdSet};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
-use nix::unistd::{isatty, read, write, pipe};
+use nix::unistd::{isatty, pipe, read, write};
 use signal_hook::flag;
 use std::env;
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
@@ -33,8 +33,8 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
 }
 
 fn setup_terminal_raw() -> Result<Termios> {
-    let mut termios = tcgetattr(std::io::stdin().as_fd())
-        .context("Failed to get terminal attributes")?;
+    let mut termios =
+        tcgetattr(std::io::stdin().as_fd()).context("Failed to get terminal attributes")?;
     let saved = termios.clone();
     cfmakeraw(&mut termios);
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &termios)
@@ -66,7 +66,9 @@ fn resize_pty<Fd: AsRawFd>(pty_fd: Fd) -> Result<()> {
     });
 
     let pty_raw = pty_fd.as_raw_fd();
-    unsafe { tiocswinsz(pty_raw, &ws).context("Failed to set pty window size")?; }
+    unsafe {
+        tiocswinsz(pty_raw, &ws).context("Failed to set pty window size")?;
+    }
     Ok(())
 }
 
@@ -97,8 +99,7 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> Result<()> {
         readfds.insert(stdin_fd);
         readfds.insert(pty_fd.as_fd());
 
-        pselect(None, &mut readfds, None, None, None, &sigmask_empty)
-            .context("pselect failed")?;
+        pselect(None, &mut readfds, None, None, None, &sigmask_empty).context("pselect failed")?;
 
         if readfds.contains(stdin_fd) {
             match read(stdin_fd.as_raw_fd(), &mut buf) {
@@ -121,15 +122,22 @@ fn do_proxy<Fd: AsFd>(pty_fd: Fd) -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let (code_snippet, module_name, file_name, start_with_imports) = parse_arguments(env::args().skip(1))?;
+    let (code_snippet, module_name, file_name, start_with_imports) =
+        parse_arguments(env::args().skip(1))?;
     if !start_with_imports.is_empty() {
         return forkserver_client::start(&start_with_imports);
     }
 
     let code_snippet = if !file_name.is_empty() {
-        format!("import runpy; runpy.run_path('{}', run_name='__main__')", file_name)
+        format!(
+            "import runpy; runpy.run_path('{}', run_name='__main__')",
+            file_name
+        )
     } else if !module_name.is_empty() {
-        format!("import runpy; runpy.run_module('{}', run_name='__main__')", module_name)
+        format!(
+            "import runpy; runpy.run_module('{}', run_name='__main__')",
+            module_name
+        )
     } else if code_snippet.is_empty() {
         "import code; code.interact(local={}, exitmsg='')".to_string()
     } else {
@@ -151,13 +159,21 @@ fn run_notty(code_snippet: &str) -> Result<()> {
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let message = format!("RUN {}", code_snippet);
-        let fd_arr = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd(), write_fd.as_raw_fd()];
+        let fd_arr = [
+            stdin.as_raw_fd(),
+            stdout.as_raw_fd(),
+            stderr.as_raw_fd(),
+            write_fd.as_raw_fd(),
+        ];
         forkserver_client::request_fork(&message, &fd_arr)?;
     }
     drop(write_fd);
 
     let mut buf = [0u8; 1];
-    while read(read_fd.as_raw_fd(), &mut buf).map_err(|e| anyhow!("Failed to read from pipe: {}", e))? > 0 {}
+    while read(read_fd.as_raw_fd(), &mut buf)
+        .map_err(|e| anyhow!("Failed to read from pipe: {}", e))?
+        > 0
+    {}
     Ok(())
 }
 
@@ -201,7 +217,9 @@ fn run_pty(code_snippet: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, String, String, String)> {
+fn parse_arguments<I: Iterator<Item = String>>(
+    mut args: I,
+) -> Result<(String, String, String, String)> {
     let mut code_snippet = String::new();
     let mut module_name = String::new();
     let mut file_name = String::new();
@@ -210,13 +228,19 @@ fn parse_arguments<I: Iterator<Item = String>>(mut args: I) -> Result<(String, S
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" => {
-                code_snippet = args.next().ok_or_else(|| anyhow!("No code snippet provided after -c"))?;
+                code_snippet = args
+                    .next()
+                    .ok_or_else(|| anyhow!("No code snippet provided after -c"))?;
             }
             "-m" => {
-                module_name = args.next().ok_or_else(|| anyhow!("No module name provided after -m"))?;
+                module_name = args
+                    .next()
+                    .ok_or_else(|| anyhow!("No module name provided after -m"))?;
             }
             "-i" => {
-                start_with_imports = args.next().ok_or_else(|| anyhow!("No import value provided after -i"))?;
+                start_with_imports = args
+                    .next()
+                    .ok_or_else(|| anyhow!("No import value provided after -i"))?;
             }
             other => {
                 file_name = other.to_string();

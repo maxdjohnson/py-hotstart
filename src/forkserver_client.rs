@@ -1,16 +1,16 @@
-use std::process::Command;
-use nix::unistd::dup;
+use anyhow::{anyhow, Context, Result};
 use nix::pty::openpty;
-use std::os::unix::io::FromRawFd;
-use nix::sys::termios::tcgetattr;
-use std::io::Read;
 use nix::sys::socket::{
     connect, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
+use nix::sys::termios::tcgetattr;
+use nix::unistd::dup;
 use std::fs;
+use std::io::Read;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::AsRawFd;
-use anyhow::{anyhow, Context, Result};
+use std::os::unix::io::FromRawFd;
+use std::process::Command;
 
 const SERVER_ADDRESS: &str = "/tmp/pyforked-server.sock";
 const SCRIPT: &str = include_str!("../pyforked-server.py");
@@ -27,7 +27,10 @@ pub fn start(prelude: &str) -> Result<()> {
         }
         // If the socket still exists after 1s, delete it
         if std::path::Path::new(SERVER_ADDRESS).exists() {
-            eprintln!("pyforked-server.py failed to clean up sock {}", SERVER_ADDRESS);
+            eprintln!(
+                "pyforked-server.py failed to clean up sock {}",
+                SERVER_ADDRESS
+            );
             if let Err(e) = fs::remove_file(SERVER_ADDRESS) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(anyhow!("Failed to remove sock {}: {}", SERVER_ADDRESS, e));
@@ -36,8 +39,11 @@ pub fn start(prelude: &str) -> Result<()> {
         }
     }
 
-    fs::write("/tmp/pyforked-server.py", format!("{}\n{}", prelude, SCRIPT))
-        .context("Failed to write server script")?;
+    fs::write(
+        "/tmp/pyforked-server.py",
+        format!("{}\n{}", prelude, SCRIPT),
+    )
+    .context("Failed to write server script")?;
 
     let termios = tcgetattr(std::io::stdin()).ok();
     let (master, slave) = openpty(None, &termios)
@@ -60,7 +66,8 @@ pub fn start(prelude: &str) -> Result<()> {
 
     let mut output = String::new();
     let mut master_file: std::fs::File = master.into();
-    master_file.read_to_string(&mut output)
+    master_file
+        .read_to_string(&mut output)
         .context("Failed to read from master")?;
 
     let status = child.wait().context("Failed to wait for child process")?;
@@ -83,8 +90,13 @@ pub fn start(prelude: &str) -> Result<()> {
 }
 
 pub fn send_exit_message() -> Result<bool> {
-    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
-        .context("socket creation failed")?;
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .context("socket creation failed")?;
     let addr = match UnixAddr::new(SERVER_ADDRESS) {
         Ok(addr) => addr,
         Err(_) => return Ok(false),
@@ -95,7 +107,8 @@ pub fn send_exit_message() -> Result<bool> {
 
     let message = "EXIT";
     let iov = [IoSlice::new(message.as_bytes())];
-    if nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).is_err() {
+    if nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).is_err()
+    {
         return Ok(false);
     }
 
@@ -103,12 +116,20 @@ pub fn send_exit_message() -> Result<bool> {
 }
 
 pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
-    let fd = socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)
-        .context("socket creation failed")?;
-    let addr = UnixAddr::new(SERVER_ADDRESS)
-        .context("UnixAddr failed")?;
-    connect(fd.as_raw_fd(), &addr)
-        .map_err(|e| anyhow!("Unable to connect to forkserver: {}\nStart the server with pyforked -i", e))?;
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .context("socket creation failed")?;
+    let addr = UnixAddr::new(SERVER_ADDRESS).context("UnixAddr failed")?;
+    connect(fd.as_raw_fd(), &addr).map_err(|e| {
+        anyhow!(
+            "Unable to connect to forkserver: {}\nStart the server with pyforked -i",
+            e
+        )
+    })?;
 
     let cmsg = [ControlMessage::ScmRights(fd_arr)];
     let iov = [IoSlice::new(command.as_bytes())];
@@ -119,12 +140,9 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
     let mut buf = [0u8; 1024];
     let response_size = {
         let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = nix::sys::socket::recvmsg::<()>(
-            fd.as_raw_fd(),
-            &mut iov,
-            None,
-            MsgFlags::empty(),
-        ).context("Error receiving response from server")?;
+        let msg =
+            nix::sys::socket::recvmsg::<()>(fd.as_raw_fd(), &mut iov, None, MsgFlags::empty())
+                .context("Error receiving response from server")?;
 
         if msg.bytes == 0 {
             return Err(anyhow!("Server disconnected prematurely (no data)."));
@@ -138,9 +156,13 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
 
     let parts: Vec<&str> = response_str.split_whitespace().collect();
     if parts.len() != 2 || parts[0] != "OK" {
-        return Err(anyhow!("Server responded with invalid message: {:?}", response_str));
+        return Err(anyhow!(
+            "Server responded with invalid message: {:?}",
+            response_str
+        ));
     }
-    let pid = parts[1].parse::<i32>()
+    let pid = parts[1]
+        .parse::<i32>()
         .map_err(|_| anyhow!("Server responded with invalid PID: {}", parts[1]))?;
 
     Ok(pid)
