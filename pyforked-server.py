@@ -122,7 +122,7 @@ def run_child(cmd, code_snippet, fds):
         os._exit(0)
 
 
-def reap_children(signum, frame):
+def handle_sigchld(signum, frame):
     """Handler for SIGCHLD to reap zombie processes."""
     while True:
         try:
@@ -158,12 +158,12 @@ def run_forkserver():
     print(f"Server listening on {SERVER_ADDRESS}")
 
     # Handle signals for clean shutdown
-    def handle_signal(signum, frame):
+    def handle_shutdown(signum, frame):
         shutdown(server, server_pid)
 
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGCHLD, reap_children)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGCHLD, handle_sigchld)
 
     write_pidfile(server_pid)
 
@@ -176,28 +176,32 @@ def run_forkserver():
 
         with conn:
             try:
+                msg, fds = recv_fds(conn)
+                cmd, code_snippet = [
+                    p.decode("utf-8", errors="replace") for p in msg.split(b" ", 1)
+                ]
+                if cmd not in {"RUN", "RUN_PTY"}:
+                    if msg:
+                        print(f"Invalid command: {msg}")
+                    continue
+
+                if not fds:
+                    print("No fds received or invalid fd.")
+                    continue
+
+                print(f"Running {cmd=} {fds=}")
                 pid = os.fork()
                 if pid == 0:
-                    msg, fds = recv_fds(conn)
-                    cmd, code_snippet = [
-                        p.decode("utf-8", errors="replace") for p in msg.split(b" ", 1)
-                    ]
-                    print(f"Received {cmd=} {code_snippet=} {fds=}")
-                    if cmd not in {"RUN", "RUN_PTY"}:
-                        if msg:
-                            print(f"Invalid command: {msg}")
-                        return
-
-                    if not fds:
-                        print("No fds received or invalid fd.")
-                        return
-                    try:
-                        conn.sendall(f"OK {pid}".encode())
-                        conn.close()
-                    except OSError as e:
-                        print(f"Error sending OK to client: {e}")
+                    conn.close()
+                    server.close()
                     run_child(cmd, code_snippet, fds)
                 else:
+                    for fd in fds:
+                        os.close(fd)
+                    try:
+                        conn.sendall(f"OK {pid}".encode())
+                    except OSError as e:
+                        print(f"Error sending OK to client: {e}")
                     conn.close()
             except Exception:
                 traceback.print_exc()
