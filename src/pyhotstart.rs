@@ -115,7 +115,7 @@ pub fn send_exit_message() -> Result<bool> {
     Ok(true)
 }
 
-pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
+pub fn request_run(pty: bool, command: &str, fd_arr: &[i32]) -> Result<()> {
     let fd = socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -126,16 +126,18 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
     let addr = UnixAddr::new(SERVER_ADDRESS).context("UnixAddr failed")?;
     connect(fd.as_raw_fd(), &addr).map_err(|e| {
         anyhow!(
-            "Unable to connect to forkserver: {}\nStart the server with py-hotstart -i",
+            "Unable to connect to server: {}\nStart the server with py-hotstart -i",
             e
         )
     })?;
 
     let cmsg = [ControlMessage::ScmRights(fd_arr)];
-    let iov = [IoSlice::new(command.as_bytes())];
+    // Send the command followed by a newline or other required terminator if needed.
+    let full_command = format!("{}\n", command);
+    let iov = [IoSlice::new(full_command.as_bytes())];
 
     nix::sys::socket::sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-        .context("Failed to send message and fd to server")?;
+        .context("Failed to send message and file descriptors to server")?;
 
     let mut buf = [0u8; 1024];
     let response_size = {
@@ -154,16 +156,13 @@ pub fn request_fork(command: &str, fd_arr: &[i32]) -> Result<i32> {
     let response_str = std::str::from_utf8(response)
         .map_err(|_| anyhow!("Server response was not valid UTF-8"))?;
 
-    let parts: Vec<&str> = response_str.split_whitespace().collect();
-    if parts.len() != 2 || parts[0] != "OK" {
+    // Expect a simple "OK" response from the server
+    if response_str.trim() != "OK" {
         return Err(anyhow!(
             "Server responded with invalid message: {:?}",
             response_str
         ));
     }
-    let pid = parts[1]
-        .parse::<i32>()
-        .map_err(|_| anyhow!("Server responded with invalid PID: {}", parts[1]))?;
 
-    Ok(pid)
+    Ok(())
 }

@@ -1,9 +1,11 @@
 import array
 import fcntl
+import importlib
 import os
 import resource
 import signal
 import socket
+import sys
 import termios
 import traceback
 
@@ -60,57 +62,10 @@ def recv_fds(conn, max_fds=1):
     return data, out_fds
 
 
-def run_child_then_exit(cmd, code_snippet, fds):
-    # In the child:
-    alive_fd = None
-    try:
-        os.setsid()
-        if cmd == "RUN_PTY":
-            # We are meant to run in a pty. Set it as the controlling terminal.
-            (slave_fd,) = fds
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            # Use the pty as fds 0-2
-            os.dup2(slave_fd, 0)
-            os.dup2(slave_fd, 1)
-            os.dup2(slave_fd, 2)
-            # Close the original fd
-            if slave_fd > 2:
-                os.close(slave_fd)
-            # Send SIGWINCH to update to new terminal state
-            os.kill(os.getpid(), signal.SIGWINCH)
-        elif cmd == "RUN":
-            # We are running outside a tty. Use the provided FDs
-            for i in range(3):
-                os.dup2(fds[i], i)
-                if fds[i] > 2:
-                    os.close(fds[i])
-            alive_fd = fds[3]
-
-        # If no code snippet provided, just exit or do something default:
-        if not code_snippet.strip():
-            # If desired, run an empty snippet just exits immediately.
-            # code.interact(local={}) # or revert to an interactive shell if needed
-            return
-
-        # Execute the provided code snippet
-        # It's safer to exec in a controlled namespace.
-        local_ns = {}
-        try:
-            exec(code_snippet, {}, local_ns)
-        except Exception:
-            traceback.print_exc()
-    finally:
-        if alive_fd is not None:
-            os.close(alive_fd)
-        os._exit(0)
-
-
 def handle_sigchld(signum, frame):
     """Handler for SIGCHLD to reap zombie processes."""
     while True:
         try:
-            # -1 means wait for any child process
-            # WNOHANG means return immediately if no child has exited
             pid, _ = os.waitpid(-1, os.WNOHANG)
             if pid <= 0:
                 break
@@ -120,7 +75,6 @@ def handle_sigchld(signum, frame):
 
 def shutdown(server, server_pid):
     if os.getpid() != server_pid:
-        # This is not the original parent process; do not remove pidfile.
         return
     server.close()
     try:
@@ -129,7 +83,78 @@ def shutdown(server, server_pid):
         traceback.print_exc()
 
 
-def run_forkserver():
+def cmd_run(code_snippet, fds):
+    """
+    Runs code snippet inline.
+    If len(fds) == 1, treat as PTY mode.
+    If len(fds) > 1, treat as normal mode with fds[0..2] as stdio.
+    After run, exit the server.
+    """
+
+    if len(fds) == 1:
+        # PTY mode
+        slave_fd = fds[0]
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        if slave_fd > 2:
+            os.close(slave_fd)
+        os.kill(os.getpid(), signal.SIGWINCH)
+    elif len(fds) >= 3:
+        # Normal mode
+        os.dup2(fds[0], 0)
+        os.dup2(fds[1], 1)
+        os.dup2(fds[2], 2)
+        for fd in fds[:3]:
+            if fd > 2:
+                os.close(fd)
+    # Run code
+    try:
+        if not code_snippet.strip():
+            return "OK"
+        local_ns = {}
+        exec(code_snippet, {}, local_ns)
+        return "OK"
+    except Exception as e:
+        tb = traceback.format_exc()
+        return f"ERROR: {e}\n{tb}"
+
+
+def get_imported_modules():
+    modules_info = []
+    for name, module in sys.modules.items():
+        path = getattr(module, "__file__", None)
+        modules_info.append((name, path))
+    return modules_info
+
+
+def cmd_imports_get():
+    mods = get_imported_modules()
+    lines = []
+    for m, p in mods:
+        if p is None:
+            p = "None"
+        lines.append(f"{m} {p}")
+    return "\n".join(lines)
+
+
+def cmd_imports_reload(modules):
+    for m in modules:
+        try:
+            if m in sys.modules:
+                importlib.reload(sys.modules[m])
+            else:
+                __import__(m)
+        except Exception:
+            # Even if one fails, we just continue
+            # The output format should remain consistent.
+            pass
+    # Now respond like imports/get
+    return cmd_imports_get()
+
+
+def run_server():
     server_pid = os.getpid()
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -137,68 +162,75 @@ def run_forkserver():
     server.listen(5)
     print(f"Server listening on {SERVER_ADDRESS}")
 
-    # Handle signals for clean shutdown
     def handle_sigterm(signum, frame):
-        print("Received shutdown signal, terminating forkserver.")
+        print("Received shutdown signal, terminating server.")
         shutdown(server, server_pid)
         os._exit(0)
 
-    default_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
-    default_sigint = signal.signal(signal.SIGINT, handle_sigterm)
-    default_sigchld = signal.signal(signal.SIGCHLD, handle_sigchld)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGCHLD, handle_sigchld)
 
-    try:
-        while True:
-            try:
-                conn, _ = server.accept()
-            except OSError as e:
-                print(f"Error on accept: {e}")
+    should_exit = False
+    while not should_exit:
+        try:
+            conn, _ = server.accept()
+        except Exception:
+            print("Error on accept")
+            traceback.print_exc()
+            break
+
+        try:
+            msg, fds = recv_fds(conn, max_fds=16)
+            if not msg:
+                conn.close()
+                continue
+            line = msg.decode("utf-8", errors="replace").strip()
+            if not line:
+                conn.sendall(b"ERROR: Empty command\n")
                 continue
 
+            parts = line.split(" ", 1)
+            cmd = parts[0]
+            arg = parts[1] if len(parts) > 1 else ""
+
+            if cmd == "exit":
+                response = "OK"
+                should_exit = True
+            elif cmd == "run":
+                response = cmd_run(arg, fds)
+                should_exit = True
+            elif cmd == "imports_get":
+                response = cmd_imports_get()
+            elif cmd == "imports_reload":
+                modules = arg.strip().split() if arg.strip() else []
+                response = cmd_imports_reload(modules)
+            else:
+                response = f"ERROR: Unknown command '{cmd}'"
+
+            if not response.endswith("\n"):
+                response += "\n"
+            conn.sendall(response.encode("utf-8"))
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"ERROR: Internal server error\n{tb}\n".encode("utf-8"))
             try:
-                msg, fds = recv_fds(conn)
-
-                # Handle EXIT message by breaking out of the loop
-                if msg.decode("utf-8", errors="replace") == "EXIT":
-                    assert not fds, "unexpected file descriptors"
-                    break
-
-                # Parse and validate command
-                cmd, code_snippet = [
-                    p.decode("utf-8", errors="replace") for p in msg.split(b" ", 1)
-                ]
-                if cmd not in {"RUN", "RUN_PTY"}:
-                    if msg:
-                        print(f"Invalid command: {msg}")
-                    continue
-
-                # Fork; child runs command while server acks
-                print(f"Running {cmd=} {code_snippet=} {fds=}")
-                pid = os.fork()
-                if pid == 0:
-                    # Clean up server resources and reset signal handlers
-                    conn.close()
-                    signal.signal(signal.SIGTERM, default_sigterm)
-                    signal.signal(signal.SIGINT, default_sigint)
-                    signal.signal(signal.SIGCHLD, default_sigchld)
-                    server.close()
-                    # Run child, then exit immeditatly without cleanup
-                    run_child_then_exit(cmd, code_snippet, fds)
-                else:
-                    # Close the fds that got copied to child
-                    for fd in fds:
-                        os.close(fd)
-                    try:
-                        conn.sendall(f"OK {pid}".encode())
-                    except OSError as e:
-                        print(f"Error sending OK to client: {e}")
+                conn.sendall(f"ERROR: Internal server error\n{tb}\n".encode("utf-8"))
             except Exception:
-                traceback.print_exc()
-            finally:
-                conn.close()
-    finally:
-        print("Received EXIT command, terminating forkserver.")
-        shutdown(server, server_pid)
+                pass
+            break
+        finally:
+            # Close any leftover FDs
+            for fd in fds:
+                if fd > 2:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            conn.close()
+
+    print("Exiting main loop, shutting down server.")
+    shutdown(server, server_pid)
 
 
 def main():
@@ -206,7 +238,7 @@ def main():
         raise ValueError(f"File {SERVER_ADDRESS} already exists")
     try:
         daemonize()
-        run_forkserver()
+        run_server()
     except Exception:
         with open(LOG_PATH, "a") as f:
             traceback.print_exc(file=f)
