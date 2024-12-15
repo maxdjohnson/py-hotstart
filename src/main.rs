@@ -6,51 +6,57 @@ use clap::Parser;
     name = "py-hotstart",
     about = "A python CLI with instant startup via an interpreter server."
 )]
-struct Cli {
-    /// Code snippet to be used
+struct Args {
+    /// (Re)create py-hotstart server with the string included
+    #[arg(short = 'i', long = "initialize", value_name = "PYTHON_CODE")]
+    initialize: Option<String>,
+
+    /// Program passed in as string.
     #[arg(short = 'c', long = "code", value_name = "PYTHON_CODE")]
     code_snippet: Option<String>,
 
-    /// Whether to start with imports
-    #[arg(short = 'i', long = "imports", value_name = "PYTHON_CODE")]
-    start_with_imports: Option<String>,
-
-    /// Module name
-    ///
-    /// If this is specified, additional arguments after `--` will be treated as the module's arguments.
+    /// Run library module as a script.
     #[arg(short = 'm', long = "module", value_name = "MODULE")]
     module_name: Option<String>,
 
-    /// File name argument
-    file_name: Option<String>,
+    /// Program read from script file.
+    file: Option<String>,
 
-    /// Arguments passed through to the python process.
+    /// Arguments passed to program in sys.argv[1:].
     /// Use `--` to delimit these arguments from the main command arguments.
     #[arg(trailing_var_arg = true)]
-    additional_args: Vec<String>,
+    args: Vec<String>,
+}
+
+impl Args {
+    fn new() -> Self {
+        let mut cli = Args::parse();
+
+        // If we have a module name and a file, then file should really be part of module args
+        if cli.module_name.is_some() && cli.file.is_some() {
+            if let Some(file) = cli.file.take() {
+                cli.args.insert(0, file);
+            }
+        }
+
+        cli
+    }
 }
 
 fn main() {
-    let cli = Cli::parse();
-    if let Err(e) = run(cli) {
+    let args = Args::new();
+    if let Err(e) = run(args) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
-    let code_snippet = cli.code_snippet.unwrap_or_default();
-    let start_with_imports = cli.start_with_imports.unwrap_or_default();
-    let mut additional_args = cli.additional_args;
-    let module_name = cli.module_name.unwrap_or_default();
-    if let Some(module_name) = cli.module_name {
-        if let Some(file_name) = cli.file_name {
-            let mut args_with_file = vec![file_name];
-            args_with_file.extend(additional_args);
-            additional_args = file_name
-        }
-    }
-    let file_name = cli.file_name.unwrap_or_default();
+fn run(args: Args) -> Result<()> {
+    let code_snippet = args.code_snippet.unwrap_or_default();
+    let initialize = args.initialize.unwrap_or_default();
+    let arguments = args.args;
+    let module_name = args.module_name.unwrap_or_default();
+    let file_name = args.file.unwrap_or_default();
 
     if code_snippet.is_empty() && module_name.is_empty() && file_name.is_empty() {
         return Err(anyhow!("No arguments provided."));
@@ -59,9 +65,9 @@ fn run(cli: Cli) -> Result<()> {
     // Implement your main logic here
     println!("Code snippet: {}", code_snippet);
     println!("Module name: {}", module_name);
-    println!("Module args: {:?}", additional_args);
+    println!("Additional args: {:?}", arguments);
     println!("File name: {}", file_name);
-    println!("Start with imports: {}", start_with_imports);
+    println!("Initialize: {}", initialize);
 
     Ok(())
 }
