@@ -152,15 +152,7 @@ impl ServerState {
     fn handle_exitcode_request(&mut self, pid_str: &str, stream: &mut UnixStream) -> Result<()> {
         // Parse the PID from the input
         let pid = nix::unistd::Pid::from_raw(i32::from_str(pid_str.trim())?);
-
-        // Wait for the process with the given PID to change state
-        let exit_code = match waitpid(Some(pid), None).with_context(|| format!("Error waiting for pid {}", pid))? {
-            WaitStatus::Exited(_, exit_code) => exit_code,
-            WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
-            _ => { bail!("Process was not exited or signaled"); }
-        };
-        let response = format!("{}\n", exit_code);
-        let _ = stream.write_all(response.as_bytes());
+        // TODO wait for pid
         Ok(())
     }
 
