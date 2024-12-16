@@ -1,4 +1,5 @@
 mod hsserver;
+mod hsclient;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
