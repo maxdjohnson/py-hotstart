@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use nix::libc;
 use nix::sys::termios::{tcgetattr, tcsetattr, Termios, LocalFlags, InputFlags, OutputFlags, ControlFlags, SetArg};
-use nix::sys::signal::SIGWINCH;
 use std::os::fd::{BorrowedFd, AsRawFd, AsFd, IntoRawFd, FromRawFd};
 use std::io::{Read, Write};
 use std::{env, fs};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::os::unix::net::UnixStream;
+use signal_hook::low_level::pipe;
+use signal_hook::consts::SIGWINCH as SIGWINCH_CONST;
 
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
@@ -108,98 +108,66 @@ sys.argv = {argv_python_list}
     // Set raw mode on user’s terminal
     let original_termios = set_raw_mode(stdin_fd)?;
 
-    // Sync window size
+    // Register pipe-based handler for SIGWINCH
+    let mut sigwinch_r = {
+        let (sigwinch_r, sigwinch_w) = UnixStream::pair().context("Failed to create UnixStream pair for signals")?;
+        sigwinch_r.set_nonblocking(true).context("Failed to set socket sigwinch_r to non-blocking")?;
+        sigwinch_w.set_nonblocking(true).context("Failed to set socket sigwinch_w to non-blocking")?;
+
+        // Register SIGWINCH with the write end of the pipe
+        unsafe {pipe::register(SIGWINCH_CONST, sigwinch_w)}.context("Failed to register SIGWINCH with pipe")?;
+        sigwinch_r
+    };
+
+    // Sync window size initially
     if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
         eprintln!("Failed to sync window size: {}", e);
     }
 
-    // Handle SIGWINCH to resize pty
-    let resize_flag = Arc::new(AtomicBool::new(false));
-    {
-        let resize_flag = Arc::clone(&resize_flag);
-        unsafe {
-            let _ = nix::sys::signal::sigaction(SIGWINCH, &nix::sys::signal::SigAction::new(
-                nix::sys::signal::SigHandler::Handler(sigwinch_handler),
-                nix::sys::signal::SaFlags::empty(),
-                nix::sys::signal::SigSet::empty(),
-            ));
-        }
-
-        extern "C" fn sigwinch_handler(_signum: i32) {
-            // Just set a global or atomic flag
-            // We'll check it in the main loop
-        }
-
-        // We'll rely on checking for SIGWINCH by blocking signals or we can use signalfd.
-        // For simplicity, let's do a signalfd approach.
-
-        // Actually, let's use signalfd for SIGWINCH:
-        let sigmask = nix::sys::signal::SigSet::empty();
-        let signalfd = nix::sys::signalfd::signalfd(-1, &sigmask, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK)
-            .expect("signalfd failed");
-        // We'll poll on signalfd FD for SIGWINCH
-        // Actually we need to add SIGWINCH to sigmask and sigprocmask.
-
-        let mut sigset = nix::sys::signal::SigSet::empty();
-        sigset.add(SIGWINCH);
-        nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_BLOCK, Some(&sigset), None).unwrap();
-
-        // Now signalfd will receive SIGWINCH
-        // We'll poll on signalfd's fd together with stdin and pty.
-    }
-
     // Write code to interpreter
+    // TODO find a better way
     {
-        // Non-blocking I/O recommended, but let's just blocking write here
+        // Blocking write here is fine for simplicity
         let mut pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd.as_raw_fd()) };
         pty_file.write_all(final_code.as_bytes())?;
         pty_file.flush()?;
-        // Keep pty_file open for reading/writing
-        // We'll re-wrap it later.
-        let pty_fd = pty_file.into_raw_fd();
-        // We'll handle I/O below
+        pty_file.into_raw_fd();
     }
 
-    // I/O forwarding loop
-    // We will use poll to handle events from stdin, pty, and signalfd
+    // I/O forwarding loop using poll
     use nix::poll::*;
-    let signalfd = {
-        let mut sigset = nix::sys::signal::SigSet::empty();
-        sigset.add(SIGWINCH);
-        nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_BLOCK, Some(&sigset), None).unwrap();
-        nix::sys::signalfd::signalfd(-1, &sigset, nix::sys::signalfd::SfdFlags::SFD_NONBLOCK)
-            .expect("signalfd failed")
-    };
 
-    let pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd.as_raw_fd()) };
+    let mut pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd.as_raw_fd()) };
     let stdin_file = std::io::stdin();
     let stdout_file = std::io::stdout();
-    let mut pty_fd = pty_file.as_fd();
-    let mut stdin_fd = stdin_file.as_fd();
-    let mut signalfd_fd = signalfd.as_fd();
+    let mut stdin_eof = false;
 
     let mut buf = [0u8; 1024];
 
     loop {
-        let mut fds = [
-            PollFd::new(stdin_fd, PollFlags::POLLIN),
+        let mut fds = vec![
+            PollFd::new(sigwinch_r.as_fd(), PollFlags::POLLIN),
             PollFd::new(pty_fd, PollFlags::POLLIN),
-            PollFd::new(signalfd_fd, PollFlags::POLLIN),
         ];
+        if !stdin_eof {
+            fds.push(PollFd::new(stdin_fd, PollFlags::POLLIN));
+        }
 
-        nix::poll::poll(&mut fds, -1)?;
+        nix::poll::poll(&mut fds,PollTimeout::NONE)?;
 
-        // Check signalfd first
-        if let Some(revents) = fds[2].revents() {
+        // Check SIGWINCH pipe
+        if let Some(revents) = fds[0].revents() {
             if revents.contains(PollFlags::POLLIN) {
-                // read signalfd
+                // Read all pending data from sigwinch_r
                 let mut sigbuf = [0u8; 128];
-                let n = signalfd.read(&mut sigbuf)?;
-                if n > 0 {
-                    // We got a signal, likely SIGWINCH
-                    if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
-                        eprintln!("Failed to sync window size: {}", e);
+                while let Ok(n) = sigwinch_r.read(&mut sigbuf) {
+                    if n == 0 {
+                        break;
                     }
+                }
+                // Re-sync window size
+                if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
+                    eprintln!("Failed to sync window size: {}", e);
                 }
             }
         }
@@ -218,16 +186,18 @@ sys.argv = {argv_python_list}
         }
 
         // Check STDIN for user input
-        if let Some(revents) = fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let n = stdin_file.lock().read(&mut buf)?;
-                if n == 0 {
-                    // EOF on stdin - close write side to PTY
-                    let _ = nix::unistd::close(pty_fd.as_raw_fd());
-                    // TODO: no longer read from stdin
-                } else {
-                    // Write to PTY
-                    nix::unistd::write(pty_fd, &buf[..n])?;
+        if !stdin_eof {
+            if let Some(revents) = fds[2].revents() {
+                if revents.contains(PollFlags::POLLIN) {
+                    let n = stdin_file.lock().read(&mut buf)?;
+                    if n == 0 {
+                        // EOF on stdin - close write side to PTY
+                        let _ = nix::unistd::close(pty_fd.as_raw_fd());
+                        stdin_eof = true;
+                    } else {
+                        // Write to PTY
+                        nix::unistd::write(pty_fd, &buf[..n])?;
+                    }
                 }
             }
         }
