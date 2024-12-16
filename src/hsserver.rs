@@ -10,12 +10,15 @@ use std::fs;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use std::io::{Read, Write, IoSlice};
 use nix::unistd::Pid;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, open, OFlag};
-use nix::unistd::{pipe2, PipeFlags};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use mio::{Events, Interest, Poll, Token};
+use std::os::unix::net;
+use mio::net::{UnixListener, UnixStream};
 use std::path::Path;
+use signal_hook::low_level::pipe;
+use signal_hook::consts::{SIGCHLD, SIGTERM, SIGINT};
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
@@ -31,11 +34,21 @@ struct ServerState {
     listener: UnixListener,
     current_interpreter: Option<InterpreterState>,
     prelude_code: Option<String>,
-    sigchld_pipe: (OwnedFd, OwnedFd),
+    sigchld_fd: UnixStream,
+    sigterm_fd: UnixStream,
 }
 
 impl ServerState {
     fn new() -> Result<ServerState> {
+        let (sigchld_fd, sigchld_write) = net::UnixStream::pair()?;
+        let (sigterm_fd, sigterm_write) = net::UnixStream::pair()?;
+        for socket in &[&sigchld_fd, &sigchld_write, &sigterm_fd, &sigterm_write] {
+            let _ = socket.set_nonblocking(true).context("Failed to set socket to non-blocking")?;
+        }
+        pipe::register(SIGCHLD, sigchld_write)?;
+        pipe::register(SIGTERM, sigterm_write.try_clone()?)?;
+        pipe::register(SIGINT, sigterm_write)?;
+
         if Path::new(SOCKET_PATH).exists() {
             fs::remove_file(SOCKET_PATH).ok();
         }
@@ -49,15 +62,12 @@ impl ServerState {
         perms.set_mode(0o600);
         fs::set_permissions(SOCKET_PATH, perms)?;
 
-        let sigchld_pipe = pipe2(PipeFlags::O_CLOEXEC).expect("Failed to create pipe");
-        debug_assert!(has_cloexec(sigchld_pipe.0.as_raw_fd()), "O_CLOEXEC not set on pipe read");
-        debug_assert!(has_cloexec(sigchld_pipe.1.as_raw_fd()), "O_CLOEXEC not set on pipe write");
-
         Ok(ServerState {
             listener,
             current_interpreter: None,
             prelude_code: None,
-            sigchld_pipe,
+            sigchld_fd: UnixStream::from_std(sigchld_fd),
+            sigterm_fd: UnixStream::from_std(sigterm_fd),
         })
     }
 
