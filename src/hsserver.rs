@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use nix::fcntl::OFlag;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::libc;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
@@ -11,7 +10,9 @@ use std::fs;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use std::io::{Read, Write, IoSlice};
 use nix::unistd::Pid;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, open, OFlag};
+use nix::unistd::{pipe2, PipeFlags};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -30,6 +31,7 @@ struct ServerState {
     listener: UnixListener,
     current_interpreter: Option<InterpreterState>,
     prelude_code: Option<String>,
+    sigchld_pipe: (OwnedFd, OwnedFd),
 }
 
 impl ServerState {
@@ -40,15 +42,22 @@ impl ServerState {
 
         let listener = UnixListener::bind(SOCKET_PATH)
             .context("Failed to bind Unix domain socket")?;
+        debug_assert!(has_cloexec(listener.as_raw_fd()), "O_CLOEXEC not set on listener");
+
         let mut perms = fs::metadata(SOCKET_PATH)?.permissions();
         // Adjust permissions if needed (e.g. 0700)
         perms.set_mode(0o600);
         fs::set_permissions(SOCKET_PATH, perms)?;
 
+        let sigchld_pipe = pipe2(PipeFlags::O_CLOEXEC).expect("Failed to create pipe");
+        debug_assert!(has_cloexec(sigchld_pipe.0.as_raw_fd()), "O_CLOEXEC not set on pipe read");
+        debug_assert!(has_cloexec(sigchld_pipe.1.as_raw_fd()), "O_CLOEXEC not set on pipe write");
+
         Ok(ServerState {
             listener,
             current_interpreter: None,
             prelude_code: None,
+            sigchld_pipe,
         })
     }
 
@@ -77,7 +86,7 @@ impl ServerState {
 
                 // Dup slave fd to stdin, stdout, stderr
                 {
-                    let slave_fd = nix::fcntl::open(
+                    let slave_fd = open(
                         std::path::Path::new(slave_path),
                         OFlag::O_RDWR,
                         Mode::empty(),
@@ -170,6 +179,7 @@ impl ServerState {
                     continue;
                 }
             };
+            debug_assert!(has_cloexec(stream.as_raw_fd()), "O_CLOEXEC not set on stream");
 
             // Handle requests in a separate block so we can use the ? operator more easily
             // and catch errors to send back to client.
@@ -261,4 +271,9 @@ fn graceful_kill(pid: Pid) -> Result<WaitStatus> {
         status = waitpid(pid, None).unwrap_or(status);
     }
     Ok(status)
+}
+
+fn has_cloexec(read_fd: RawFd) -> bool {
+    let read_flags = fcntl(read_fd, FcntlArg::F_GETFD).expect("Failed to get flags");
+    FdFlag::from_bits_truncate(read_flags).contains(FdFlag::FD_CLOEXEC)
 }
