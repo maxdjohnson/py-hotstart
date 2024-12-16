@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::{env, fs};
 use std::os::unix::net::UnixStream;
 use signal_hook::low_level::pipe;
-use signal_hook::consts::SIGWINCH as SIGWINCH_CONST;
+use signal_hook::consts::SIGWINCH;
 
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
@@ -102,8 +102,10 @@ sys.argv = {argv_python_list}
         _ => unreachable!()
     };
 
-    let stdin_fd = std::io::stdin().as_fd();
-    let stdout_fd = std::io::stdout().as_fd();
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_fd = stdin.as_fd();
+    let stdout_fd = stdout.as_fd();
 
     // Set raw mode on user’s terminal
     let original_termios = set_raw_mode(stdin_fd)?;
@@ -115,7 +117,7 @@ sys.argv = {argv_python_list}
         sigwinch_w.set_nonblocking(true).context("Failed to set socket sigwinch_w to non-blocking")?;
 
         // Register SIGWINCH with the write end of the pipe
-        unsafe {pipe::register(SIGWINCH_CONST, sigwinch_w)}.context("Failed to register SIGWINCH with pipe")?;
+        pipe::register(SIGWINCH, sigwinch_w).context("Failed to register SIGWINCH with pipe")?;
         sigwinch_r
     };
 
@@ -145,27 +147,36 @@ sys.argv = {argv_python_list}
     let mut buf = [0u8; 1024];
 
     loop {
-        let mut fds = vec![
-            PollFd::new(sigwinch_r.as_fd(), PollFlags::POLLIN),
-            PollFd::new(pty_fd, PollFlags::POLLIN),
-        ];
+        let mut fds = Vec::with_capacity(3);
+        fds.push(PollFd::new(sigwinch_r.as_fd(), PollFlags::POLLIN));
+        fds.push(PollFd::new(pty_fd, PollFlags::POLLIN));
         if !stdin_eof {
             fds.push(PollFd::new(stdin_fd, PollFlags::POLLIN));
         }
 
-        nix::poll::poll(&mut fds,PollTimeout::NONE)?;
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE)?;
 
-        // Check SIGWINCH pipe
-        if let Some(revents) = fds[0].revents() {
+        // Extract events into local variables
+        let sigwinch_revents = fds[0].revents();
+        let pty_revents = fds.get(1).and_then(|f| f.revents());
+        let stdin_revents = if !stdin_eof {
+            fds.get(2).and_then(|f| f.revents())
+        } else {
+            None
+        };
+
+        // Drop fds here, ending the borrow of sigwinch_r
+        drop(fds);
+
+        // Now we can safely read from sigwinch_r
+        if let Some(revents) = sigwinch_revents {
             if revents.contains(PollFlags::POLLIN) {
-                // Read all pending data from sigwinch_r
                 let mut sigbuf = [0u8; 128];
                 while let Ok(n) = sigwinch_r.read(&mut sigbuf) {
                     if n == 0 {
                         break;
                     }
                 }
-                // Re-sync window size
                 if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
                     eprintln!("Failed to sync window size: {}", e);
                 }
@@ -173,7 +184,7 @@ sys.argv = {argv_python_list}
         }
 
         // Check PTY for output
-        if let Some(revents) = fds[1].revents() {
+        if let Some(revents) = pty_revents {
             if revents.contains(PollFlags::POLLIN) {
                 let n = pty_file.read(&mut buf)?;
                 if n == 0 {
@@ -187,7 +198,7 @@ sys.argv = {argv_python_list}
 
         // Check STDIN for user input
         if !stdin_eof {
-            if let Some(revents) = fds[2].revents() {
+            if let Some(revents) = stdin_revents {
                 if revents.contains(PollFlags::POLLIN) {
                     let n = stdin_file.lock().read(&mut buf)?;
                     if n == 0 {
@@ -195,13 +206,13 @@ sys.argv = {argv_python_list}
                         let _ = nix::unistd::close(pty_fd.as_raw_fd());
                         stdin_eof = true;
                     } else {
-                        // Write to PTY
-                        nix::unistd::write(pty_fd, &buf[..n])?;
+                        nix::unistd::write(pty_fd.as_fd(), &buf[..n])?;
                     }
                 }
             }
         }
     }
+
     restore_mode(stdin_fd, &original_termios);
     Ok(())
 }
