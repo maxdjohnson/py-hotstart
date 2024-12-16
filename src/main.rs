@@ -1,3 +1,7 @@
+mod hsclient;
+mod hsserver;
+mod hstty;
+
 use anyhow::{anyhow, Result};
 use clap::Parser;
 
@@ -52,22 +56,15 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
-    let code_snippet = args.code_snippet.unwrap_or_default();
-    let initialize = args.initialize.unwrap_or_default();
-    let arguments = args.args;
-    let module_name = args.module_name.unwrap_or_default();
-    let file_name = args.file.unwrap_or_default();
-
-    if code_snippet.is_empty() && module_name.is_empty() && file_name.is_empty() {
-        return Err(anyhow!("No arguments provided."));
+    if let Some(prelude_code) = args.initialize {
+        return hsclient::start_server(&prelude_code);
+    } else if let Some(module_name) = args.module_name {
+        return hstty.run_module(module_name, args.args);
+    } else if let Some(file_name) = args.file {
+        return hstty.run_file(file_name, args.args);
+    } else if let Some(python_code) = args.code_snippet {
+        return hstty.run_code(python_code);
+    } else {
+        return hstty.run_repl();
     }
-
-    // Implement your main logic here
-    println!("Code snippet: {}", code_snippet);
-    println!("Module name: {}", module_name);
-    println!("Additional args: {:?}", arguments);
-    println!("File name: {}", file_name);
-    println!("Initialize: {}", initialize);
-
-    Ok(())
 }
