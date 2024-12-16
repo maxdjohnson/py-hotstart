@@ -66,9 +66,70 @@ fn main() -> Result<()> {
         process::exit(1);
     }
 
+    let cwd = env::current_dir().context("Failed to get current directory")?;
+    let cwd_str = cwd.to_str().ok_or_else(|| anyhow::anyhow!("CWD not UTF-8"))?;
+
+    let env_vars: Vec<(String, String)> = env::vars().collect();
+    let mut env_lines = String::new();
+    for (k,v) in env_vars {
+        let k_esc = k.replace("'", "\\'");
+        let v_esc = v.replace("'", "\\'");
+        env_lines.push_str(&format!("    os.environ['{k_esc}'] = '{v_esc}'\n"));
+    }
+
+    let mut argv = vec![];
+    match exec_mode.as_str() {
+        "code" => {
+            argv.push("".to_string());
+        }
+        "module" => {
+            argv.push(user_code.to_string());
+            argv.extend(script_args.iter().cloned());
+        }
+        "script" => {
+            argv.push(user_code.to_string());
+            argv.extend(script_args.iter().cloned());
+        }
+        _ => {}
+    }
+
+    let argv_python_list = {
+        let mut s = String::from("[");
+        for arg in &argv {
+            let a_esc = arg.replace("'", "\\'");
+            s.push_str(&format!("'{}', ", a_esc));
+        }
+        s.push(']');
+        s
+    };
+
+    let setup_code = format!(r#"
+import sys, os, runpy
+
+os.environ.clear()
+{env_lines}
+os.chdir('{cwd_str}')
+sys.argv = {argv_python_list}
+"#, env_lines=env_lines, cwd_str=cwd_str, argv_python_list=argv_python_list);
+
+    let final_code = match exec_mode.as_str() {
+        "code" => {
+            format!("{setup_code}\nexec({:?}, {{'__name__':'__main__'}})", user_code)
+        },
+        "module" => {
+            format!("{setup_code}\nrunpy.run_module({:?}, run_name='__main__')", user_code)
+        },
+        "script" => {
+            let script_contents = fs::read_to_string(&user_code)
+                .with_context(|| format!("Failed to read script '{}'", user_code))?;
+            format!("{setup_code}\nexec({:?}, {{'__name__':'__main__'}})", script_contents)
+        },
+        _ => unreachable!()
+    };
+
     let interpreter = take_interpreter()?;
 
-    do_proxy(interpreter.pty_master_fd.as_fd(), &exec_mode, &user_code, &script_args)?;
+    do_proxy(interpreter.pty_master_fd.as_fd(), &final_code)?;
 
     // Get exit code
     let exit_code = get_exit_code(&interpreter)?;
