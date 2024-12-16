@@ -25,6 +25,11 @@ nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 
+// Tokens for event sources
+const LISTENER: Token = Token(0);
+const SIGCHLD_TOKEN: Token = Token(1);
+const SIGTERM_TOKEN: Token = Token(2);
+
 struct InterpreterState {
     pid: Pid,
     pty_master_fd: PtyMaster,
@@ -40,14 +45,18 @@ struct ServerState {
 
 impl ServerState {
     fn new() -> Result<ServerState> {
-        let (sigchld_fd, sigchld_write) = net::UnixStream::pair()?;
-        let (sigterm_fd, sigterm_write) = net::UnixStream::pair()?;
-        for socket in &[&sigchld_fd, &sigchld_write, &sigterm_fd, &sigterm_write] {
-            let _ = socket.set_nonblocking(true).context("Failed to set socket to non-blocking")?;
-        }
-        pipe::register(SIGCHLD, sigchld_write)?;
-        pipe::register(SIGTERM, sigterm_write.try_clone()?)?;
-        pipe::register(SIGINT, sigterm_write)?;
+        let (sigchld_fd, sigterm_fd)= {
+            let (sigchld_r, sigchld_w) = net::UnixStream::pair()?;
+            let (sigterm_r, sigterm_w) = net::UnixStream::pair()?;
+            let sigint_w = sigterm_w.try_clone()?;
+            for socket in &[&sigchld_r, &sigchld_w, &sigterm_r, &sigterm_w, &sigint_w] {
+                let _ = socket.set_nonblocking(true).context("Failed to set socket to non-blocking")?;
+            }
+            pipe::register(SIGCHLD, sigchld_w)?;
+            pipe::register(SIGTERM, sigterm_w)?;
+            pipe::register(SIGINT, sigint_w)?;
+            (UnixStream::from_std(sigchld_r), UnixStream::from_std(sigterm_r))
+        };
 
         if Path::new(SOCKET_PATH).exists() {
             fs::remove_file(SOCKET_PATH).ok();
@@ -66,8 +75,8 @@ impl ServerState {
             listener,
             current_interpreter: None,
             prelude_code: None,
-            sigchld_fd: UnixStream::from_std(sigchld_fd),
-            sigterm_fd: UnixStream::from_std(sigterm_fd),
+            sigchld_fd,
+            sigterm_fd,
         })
     }
 
@@ -286,4 +295,118 @@ fn graceful_kill(pid: Pid) -> Result<WaitStatus> {
 fn has_cloexec(read_fd: RawFd) -> bool {
     let read_flags = fcntl(read_fd, FcntlArg::F_GETFD).expect("Failed to get flags");
     FdFlag::from_bits_truncate(read_flags).contains(FdFlag::FD_CLOEXEC)
+}
+
+
+fn main() -> Result<()> {
+    let mut state = ServerState::new()?;
+
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+
+    // Register the listener
+    poll.registry().register(&mut state.listener, LISTENER, Interest::READABLE)?;
+
+    // Register the signal FDs
+    // Reading from these will tell us when a signal has occurred
+    poll.registry().register(&mut state.sigchld_fd, SIGCHLD_TOKEN, Interest::READABLE)?;
+    poll.registry().register(&mut state.sigterm_fd, SIGTERM_TOKEN, Interest::READABLE)?;
+
+    // Store active clients
+    let mut clients: HashMap<Token, MioUnixStream> = HashMap::new();
+    let mut next_token_id = 3; // Start after 2 since we used 0,1,2 already
+
+    loop {
+        poll.poll(&mut events, None)?;
+
+        for event in events.iter() {
+            match event.token() {
+                LISTENER => {
+                    // Accept new connections
+                    loop {
+                        match state.listener.accept() {
+                            Ok((mut stream, addr)) => {
+                                let token = Token(next_token_id);
+                                next_token_id += 1;
+
+                                // Register the new client
+                                poll.registry().register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)?;
+                                clients.insert(token, stream);
+
+                                eprintln!("New connection from {:?}", addr);
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // No more clients to accept
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("Accept error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                SIGCHLD_TOKEN => {
+                    // SIGCHLD occurred. Read from the pipe to clear it.
+                    handle_signal_fd(&mut state.sigchld_fd, "SIGCHLD")?;
+                    // TODO: handle child process logic here (e.g., waitpid)
+                }
+
+                SIGTERM_TOKEN => {
+                    // SIGTERM or SIGINT occurred. Read from the pipe to clear it.
+                    handle_signal_fd(&mut state.sigterm_fd, "SIGTERM/SIGINT")?;
+                    // TODO: handle graceful shutdown logic here
+                    eprintln!("Received SIGTERM/SIGINT, shutting down...");
+                    return Ok(());
+                }
+
+                token => {
+                    // Data available on a client connection or it’s writable
+                    if let Some(stream) = clients.get_mut(&token) {
+                        if event.is_readable() {
+                            let mut buf = [0u8; 1024];
+                            match stream.read(&mut buf) {
+                                Ok(0) => {
+                                    // Client disconnected
+                                    eprintln!("Client {:?} disconnected", token);
+                                    clients.remove(&token);
+                                }
+                                Ok(n) => {
+                                    eprintln!("Read {} bytes from {:?}", n, token);
+                                    // Echo back for demonstration
+                                    if event.is_writable() {
+                                        let _ = stream.write_all(&buf[..n]);
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // No more data to read now
+                                }
+                                Err(e) => {
+                                    eprintln!("Error reading from client {:?}: {}", token, e);
+                                    clients.remove(&token);
+                                }
+                            }
+                        }
+                        // event.is_writable() can also be checked here if you had pending writes
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn handle_signal_fd(stream: &mut UnixStream, signal_name: &str) -> Result<()> {
+    let mut buf = [0u8; 64];
+    // Just read whatever is there to clear the event
+    match stream.read(&mut buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // Nothing to read; ignore
+        }
+        Err(e) => {
+            eprintln!("Error reading {} signal pipe: {}", signal_name, e);
+        }
+    }
+    Ok(())
 }
