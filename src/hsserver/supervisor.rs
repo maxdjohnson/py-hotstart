@@ -16,7 +16,7 @@ nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 // Pair of child_id and Pid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ChildId {
+pub struct ChildId {
     id: u32,
     pid: Pid
 }
@@ -29,6 +29,14 @@ impl fmt::Display for ChildId {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParseChildIdError;
+
+impl std::fmt::Display for ParseChildIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid ChildId")
+    }
+}
+
+impl std::error::Error for ParseChildIdError {}
 
 impl FromStr for ChildId {
     type Err = ParseChildIdError;
@@ -51,22 +59,25 @@ impl ChildId {
     fn new(id: u32, pid: Pid) -> Self {
         ChildId { id, pid }
     }
+    pub fn get_pid(&self) -> Pid {
+        self.pid
+    }
 }
 
 
-struct Supervisor {
+pub struct Supervisor {
     next_child_id: u32,
     running_children: HashMap<Pid, u32>,
     exit_info: ExitInfoRecord,
 }
 
 impl Supervisor {
-    fn new() -> Result<Self> {
-        Ok(Supervisor {
+    pub fn new() -> Self {
+        Supervisor {
             next_child_id: 1,
             running_children: HashMap::new(),
             exit_info: ExitInfoRecord::new(128),
-        })
+        }
     }
 
     pub fn spawn_interpreter(&mut self, prelude_code: Option<&str>) -> Result<(ChildId, PtyMaster)> {
@@ -218,3 +229,35 @@ impl Interpreter {
         }
     }
 }
+
+
+/*
+use std::fmt;
+use nix::unistd::Pid;
+use std::str::FromStr;
+use nix::pty::PtyMaster;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChildId { }
+
+impl fmt::Display for ChildId {
+    // implementation omitted
+}
+
+impl FromStr for ChildId {
+    // implementation omitted
+}
+
+impl Supervisor {
+    pub fn spawn_interpreter(&mut self, prelude_code: Option<&str>) -> Result<(ChildId, PtyMaster), Box<dyn std::error::Error>> {
+        unimplemented!()
+    }
+
+    pub fn get_exit_code(&mut self, child_id: ChildId) -> Result<i32, Box<dyn std::error::Error>> {
+        unimplemented!()
+    }
+
+    pub fn handle_sigchld(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        unimplemented!()
+    }
+} */

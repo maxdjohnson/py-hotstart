@@ -13,56 +13,19 @@ use nix::unistd::Pid;
 use std::os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, open, OFlag};
 use std::os::unix::fs::PermissionsExt;
-use mio::{Events, Interest, Poll, Token};
-use std::os::unix::net;
-use mio::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixStream, UnixListener};
 use std::path::Path;
 use signal_hook::low_level::pipe;
 use signal_hook::consts::{SIGCHLD, SIGTERM, SIGINT};
-
-
-use std::fmt;
-use nix::unistd::Pid;
-use std::str::FromStr;
-use nix::pty::PtyMaster;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChildId { }
-
-impl fmt::Display for ChildId {
-    // implementation omitted
-}
-
-impl FromStr for ChildId {
-    // implementation omitted
-}
-
-impl Supervisor {
-    pub fn spawn_interpreter(&mut self, prelude_code: Option<&str>) -> Result<(ChildId, PtyMaster), Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-
-    pub fn get_exit_code(&mut self, child_id: ChildId) -> Result<i32, Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-
-    pub fn handle_sigchld(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-}
+use crate::hsserver::supervisor::{ChildId, Supervisor};
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 
-// Tokens for event sources
-const LISTENER: Token = Token(0);
-const SIGCHLD_TOKEN: Token = Token(1);
-const SIGTERM_TOKEN: Token = Token(2);
-
 struct InterpreterState {
-    pid: Pid,
+    id: ChildId,
     pty_master_fd: PtyMaster,
 }
 
@@ -70,6 +33,7 @@ struct ServerState {
     listener: UnixListener,
     current_interpreter: Option<InterpreterState>,
     prelude_code: Option<String>,
+    supervisor: Supervisor,
     sigchld_fd: UnixStream,
     sigterm_fd: UnixStream,
 }
@@ -77,8 +41,8 @@ struct ServerState {
 impl ServerState {
     fn new() -> Result<ServerState> {
         let (sigchld_fd, sigterm_fd)= {
-            let (sigchld_r, sigchld_w) = net::UnixStream::pair()?;
-            let (sigterm_r, sigterm_w) = net::UnixStream::pair()?;
+            let (sigchld_r, sigchld_w) = UnixStream::pair()?;
+            let (sigterm_r, sigterm_w) = UnixStream::pair()?;
             let sigint_w = sigterm_w.try_clone()?;
             for socket in &[&sigchld_r, &sigchld_w, &sigterm_r, &sigterm_w, &sigint_w] {
                 let _ = socket.set_nonblocking(true).context("Failed to set socket to non-blocking")?;
@@ -86,7 +50,7 @@ impl ServerState {
             pipe::register(SIGCHLD, sigchld_w)?;
             pipe::register(SIGTERM, sigterm_w)?;
             pipe::register(SIGINT, sigint_w)?;
-            (UnixStream::from_std(sigchld_r), UnixStream::from_std(sigterm_r))
+            (sigchld_r, sigterm_r)
         };
 
         if Path::new(SOCKET_PATH).exists() {
@@ -106,44 +70,21 @@ impl ServerState {
             listener,
             current_interpreter: None,
             prelude_code: None,
+            supervisor: Supervisor::new(),
             sigchld_fd,
             sigterm_fd,
         })
     }
 
-
-    fn handle_initialize(&mut self, prelude: &str) -> Result<()> {
-        // In a real implementation, we’d kill the old interpreter gracefully and wait on it.
-        if let Some(interp) = &self.current_interpreter {
-            graceful_kill(interp.pid)?;
-        }
-        self.prelude_code = Some(prelude.to_string());
-        self.spawn_interpreter()?;
+    fn spawn_interpreter(&mut self) -> Result<()> {
+        let (id, fd )= self.supervisor.spawn_interpreter(self.prelude_code.as_deref())?;
+        self.current_interpreter = Some(InterpreterState{id, pty_master_fd: fd});
         Ok(())
     }
 
-    fn handle_run_request(&mut self, stream: &mut UnixStream) -> Result<()> {
-        if let Some(interp) = self.current_interpreter.take() {
+    fn handle_take(&mut self, stream: &mut UnixStream) -> Result<()> {
+        if let Some(interp) =  {
             // Send the FD to the client
-            let response = format!("OK {}", interp.pid);
-            let iov = [IoSlice::new(response.as_bytes())];
-            let fds = [interp.pty_master_fd.as_raw_fd()];
-            let cmsg = [ControlMessage::ScmRights(&fds)];
-
-            let sent = sendmsg::<()>(
-                stream.as_raw_fd(),
-                &iov,
-                &cmsg,
-                MsgFlags::empty(),
-                None
-            ).context("Failed to sendmsg")?;
-
-            if sent != 2 {
-                eprintln!("Did not send all bytes expected");
-            }
-
-            // Spawn a new interpreter for next request
-            self.spawn_interpreter()?;
         } else {
             // No interpreter ready
             stream.write_all(b"ERROR")?;
@@ -151,10 +92,7 @@ impl ServerState {
         Ok(())
     }
 
-    fn handle_exitcode_request(&mut self, pid_str: &str, stream: &mut UnixStream) -> Result<()> {
-        // Parse the PID from the input
-        let pid = nix::unistd::Pid::from_raw(i32::from_str(pid_str.trim())?);
-        // TODO wait for pid
+    fn handle_exitcode_request(&mut self, id_str: &str, stream: &mut UnixStream) -> Result<()> {
         Ok(())
     }
 
@@ -203,17 +141,34 @@ impl ServerState {
         let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
         if req.starts_with("INIT ") {
+            // Restart the current interpreter
             let prelude = req.strip_prefix("INIT ").unwrap();
-            self.handle_initialize(prelude)
-                .context("Failed to initialize with new prelude")?;
+            if let Some(interp) = &self.current_interpreter {
+                graceful_kill(interp.id.get_pid())?;
+            }
+            self.prelude_code = Some(prelude.to_string());
+            self.spawn_interpreter()?;
             stream.write_all(b"OK").context("Failed to write response")?;
-        } else if req == "RUN" {
-            self.handle_run_request(&mut stream).context("Failed to handle RUN request")?;
+        } else if req == "TAKE" {
+            // Take the interpreter and return it
+            let interp = self.current_interpreter.take().context("no interpreter")?;
+            let response = format!("OK {}", interp.id);
+            let iov = [IoSlice::new(response.as_bytes())];
+            let fds = [interp.pty_master_fd.as_raw_fd()];
+            let cmsg = [ControlMessage::ScmRights(&fds)];
+            sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).context("Failed to sendmsg")?;
+
+            // Spawn a new interpreter for next request
+            self.spawn_interpreter()?;
         } else if req.starts_with("EXITCODE ") {
-            let pid_str = req.strip_prefix("EXITCODE ").unwrap();
-            self.handle_exitcode_request(pid_str, &mut stream).context("Failed to handle EXITCODE request")?;
+            // Get exit code from supervisor
+            let id_str = req.strip_prefix("EXITCODE ").unwrap();
+            let child_id = ChildId::from_str(id_str.trim()).with_context(|| format!("child_id='{}'", id_str))?;
+            let exit_code = self.supervisor.get_exit_code(child_id)?;
+            stream.write_all(format!("OK {}", exit_code).as_bytes())
+                .context("Failed to write exit code response")?;
         } else {
-            stream.write_all(b"UNKNOWN").context("Failed to write UNKNOWN response")?;
+            bail!("Unknown command '{}'", req)
         }
 
         Ok(())
