@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::fcntl::OFlag;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::libc;
@@ -6,12 +6,13 @@ use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::sys::stat::Mode;
 use nix::unistd::{fork, ForkResult, setsid, dup2, getpid, execvp, tcsetpgrp, close};
 use std::ffi::CString;
+use std::str::FromStr;
 use std::fs;
-use std::io::{Read, Write, IoSlice, IoSliceMut};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use std::io::{Read, Write, IoSlice};
 use nix::unistd::Pid;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{IntoRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
@@ -122,7 +123,8 @@ impl ServerState {
     fn handle_run_request(&mut self, stream: &mut UnixStream) -> Result<()> {
         if let Some(interp) = self.current_interpreter.take() {
             // Send the FD to the client
-            let iov = [IoSlice::new(b"OK")];
+            let response = format!("OK {}", interp.pid);
+            let iov = [IoSlice::new(response.as_bytes())];
             let fds = [interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
 
@@ -147,38 +149,79 @@ impl ServerState {
         Ok(())
     }
 
-    fn handle_exitcode_request(&mut self, stream: &mut UnixStream) -> Result<()> {
-        // In a real implementation, we would wait on the old interpreter’s PID if we had stored it.
-        // For now, just return 0.
-        stream.write_all(b"0")?;
+    fn handle_exitcode_request(&mut self, pid_str: &str, stream: &mut UnixStream) -> Result<()> {
+        // Parse the PID from the input
+        let pid = nix::unistd::Pid::from_raw(i32::from_str(pid_str.trim())?);
+
+        // Wait for the process with the given PID to change state
+        let exit_code = match waitpid(Some(pid), None).with_context(|| format!("Error waiting for pid {}", pid))? {
+            WaitStatus::Exited(_, exit_code) => exit_code,
+            WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+            _ => { bail!("Process was not exited or signaled"); }
+        };
+        let response = format!("{}\n", exit_code);
+        let _ = stream.write_all(response.as_bytes());
         Ok(())
     }
+
 
     fn run(&mut self) -> Result<()> {
         self.spawn_interpreter()?;
 
         loop {
-            let (mut stream, _addr) = self.listener.accept().context("Accept failed")?;
+            // Accept a connection
+            let (mut stream, _addr) = match self.listener.accept() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // If accept fails, just log and continue
+                    eprintln!("Accept failed: {}", e);
+                    continue;
+                }
+            };
 
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf)?;
-            if n == 0 {
+            // Handle requests in a separate block so we can use the ? operator more easily
+            // and catch errors to send back to client.
+            if let Err(err) = self.handle(&mut stream) {
+                // If we get here, an error occurred
+                eprintln!("Error handling request: {:?}", err);
+
+                // Attempt to send an error message back to the client
+                // Note: The client might have already closed the connection or
+                // we might fail again, but we'll try gracefully.
+                let err_msg = format!("ERROR: {}\n", err);
+                let _ = stream.write_all(err_msg.as_bytes());
+
+                // Continue with next iteration of the loop (keep listening)
                 continue;
             }
-            let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-
-            if req.starts_with("INIT ") {
-                let prelude = req.strip_prefix("INIT ").unwrap();
-                self.handle_initialize(prelude)?;
-                stream.write_all(b"OK")?;
-            } else if req == "RUN" {
-                self.handle_run_request(&mut stream)?;
-            } else if req == "EXITCODE" {
-                self.handle_exitcode_request(&mut stream)?;
-            } else {
-                stream.write_all(b"UNKNOWN")?;
-            }
         }
+    }
+
+    fn handle(&mut self, mut stream: &mut UnixStream) -> Result<()> {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).context("Failed to read request")?;
+        if n == 0 {
+            // Client closed connection; just continue
+            return Ok(());
+        }
+
+        let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+
+        if req.starts_with("INIT ") {
+            let prelude = req.strip_prefix("INIT ").unwrap();
+            self.handle_initialize(prelude)
+                .context("Failed to initialize with new prelude")?;
+            stream.write_all(b"OK").context("Failed to write response")?;
+        } else if req == "RUN" {
+            self.handle_run_request(&mut stream).context("Failed to handle RUN request")?;
+        } else if req.starts_with("EXITCODE ") {
+            let pid_str = req.strip_prefix("EXITCODE ").unwrap();
+            self.handle_exitcode_request(pid_str, &mut stream).context("Failed to handle EXITCODE request")?;
+        } else {
+            stream.write_all(b"UNKNOWN").context("Failed to write UNKNOWN response")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -189,7 +232,7 @@ fn main() -> Result<()> {
 }
 
 
-fn graceful_kill(pid: Pid) -> Result<nix::sys::wait::WaitStatus> {
+fn graceful_kill(pid: Pid) -> Result<WaitStatus> {
     // Send SIGTERM to request graceful termination
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGTERM);
 
@@ -200,10 +243,10 @@ fn graceful_kill(pid: Pid) -> Result<nix::sys::wait::WaitStatus> {
     let start = Instant::now();
     let timeout = Duration::from_secs(2);
 
-    let mut status = nix::sys::wait::WaitStatus::StillAlive;
+    let mut status = WaitStatus::StillAlive;
     while start.elapsed() < timeout {
-        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
                 // Not exited yet, wait a bit longer
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -219,11 +262,11 @@ fn graceful_kill(pid: Pid) -> Result<nix::sys::wait::WaitStatus> {
         }
     }
 
-    if status != nix::sys::wait::WaitStatus::StillAlive {
+    if status != WaitStatus::StillAlive {
         // Still running after graceful timeout, send SIGKILL
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
         // Now wait without WNOHANG since SIGKILL should terminate it quickly
-        status = nix::sys::wait::waitpid(pid, None).unwrap_or(status);
+        status = waitpid(pid, None).unwrap_or(status);
     }
     Ok(status)
 }
