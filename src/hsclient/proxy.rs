@@ -5,7 +5,6 @@ use nix::libc;
 use nix::sys::termios::{tcgetattr, tcsetattr, Termios, SetArg, cfmakeraw};
 use nix::unistd::{read, write, close};
 use std::os::fd::{BorrowedFd, AsFd, AsRawFd};
-use std::{env, fs};
 use std::os::unix::net::UnixStream;
 use signal_hook::low_level::pipe;
 use signal_hook::consts::SIGWINCH;
@@ -15,6 +14,7 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
 
+/// RAII guard for terminal mode restoration.
 struct TerminalModeGuard {
     fd: BorrowedFd<'static>,
     original: Termios,
@@ -22,15 +22,13 @@ struct TerminalModeGuard {
 
 impl TerminalModeGuard {
     fn new(fd: BorrowedFd<'_>) -> Result<TerminalModeGuard> {
-        let termios = tcgetattr(fd)?;
+        let termios = tcgetattr(fd).context("Failed to get terminal attributes")?;
         let original = termios.clone();
         let mut raw = termios;
         cfmakeraw(&mut raw);
-        tcsetattr(fd, SetArg::TCSANOW, &raw)?;
-        // Extend lifetime of fd borrow by making a 'static reference.
-        // Safe here because we're not actually extending fd lifetime beyond main function scope;
-        // Just be careful that fd outlives this guard.
-        // An alternative is to store the raw_fd and re-borrow it as needed.
+        tcsetattr(fd, SetArg::TCSANOW, &raw).context("Failed to set terminal to raw mode")?;
+
+        // Extend lifetime of fd borrow by making it 'static.
         let fd_static: BorrowedFd<'static> = unsafe { std::mem::transmute(fd) };
         Ok(TerminalModeGuard { fd: fd_static, original })
     }
@@ -42,10 +40,18 @@ impl Drop for TerminalModeGuard {
     }
 }
 
+/// Sync the terminal window size from `from_fd` to `to_fd`.
 fn sync_winsize(from_fd: BorrowedFd, to_fd: BorrowedFd) -> Result<()> {
-    let mut ws: libc::winsize = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut ws: libc::winsize = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
     let res = unsafe { tiocgwinsz(from_fd.as_raw_fd(), &mut ws) };
-    if let Err(_) = res {
+    if res.is_err() {
+        eprintln!("Failed to get terminal size: {:?}", res);
         // If we can't get the terminal size, use a default.
         ws = libc::winsize {
             ws_row: 30,
@@ -54,10 +60,14 @@ fn sync_winsize(from_fd: BorrowedFd, to_fd: BorrowedFd) -> Result<()> {
             ws_ypixel: 480,
         };
     }
-    unsafe { tiocswinsz(to_fd.as_raw_fd(), &ws) }.context("failed to set winsize")?;
+
+    unsafe { tiocswinsz(to_fd.as_raw_fd(), &ws) }
+        .context("failed to set winsize")?;
+
     Ok(())
 }
 
+/// Write all bytes from `buf` to `fd` until exhausted or error.
 fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
     while !buf.is_empty() {
         match write(fd.as_fd(), buf) {
@@ -72,34 +82,38 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
     Ok(())
 }
 
-pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let stdin_fd = stdin.as_fd();
-    let stdout_fd = stdout.as_fd();
+/// Setup the terminal in raw mode and return a guard that restores it on drop.
+fn setup_terminal_mode(stdin_fd: BorrowedFd) -> Result<TerminalModeGuard> {
+    TerminalModeGuard::new(stdin_fd)
+}
 
-    // Set raw mode on user’s terminal with guard
-    let _mode_guard = TerminalModeGuard::new(stdin_fd)?;
+/// Set up SIGWINCH signal handling via a UnixStream pair and register with signal_hook.
+fn setup_sigwinch_stream() -> Result<UnixStream> {
+    let (sigwinch_r, sigwinch_w) = UnixStream::pair().context("Failed to create UnixStream pair for signals")?;
+    sigwinch_r.set_nonblocking(true).context("Failed to set sigwinch_r to non-blocking")?;
+    sigwinch_w.set_nonblocking(true).context("Failed to set sigwinch_w to non-blocking")?;
+    pipe::register(SIGWINCH, sigwinch_w).context("Failed to register SIGWINCH with pipe")?;
+    Ok(sigwinch_r)
+}
 
-    // Register pipe-based handler for SIGWINCH
-    let mut sigwinch_r = {
-        let (sigwinch_r, sigwinch_w) = UnixStream::pair().context("Failed to create UnixStream pair for signals")?;
-        sigwinch_r.set_nonblocking(true).context("Failed to set socket sigwinch_r to non-blocking")?;
-        sigwinch_w.set_nonblocking(true).context("Failed to set socket sigwinch_w to non-blocking")?;
-
-        // Register SIGWINCH with the write end of the pipe
-        pipe::register(SIGWINCH, sigwinch_w).context("Failed to register SIGWINCH with pipe")?;
-        sigwinch_r
-    };
-
-    // Sync window size initially
-    if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
-        eprintln!("Failed to sync window size: {}", e);
+/// Drain the signal stream after a POLLIN event.
+fn drain_all(sigwinch_r: &mut UnixStream) -> Result<()> {
+    let mut sigbuf = [0u8; 128];
+    while let Ok(n) = sigwinch_r.read(&mut sigbuf) {
+        if n == 0 {
+            break;
+        }
     }
+    Ok(())
+}
 
-    // Write code to interpreter
-    write_all(pty_fd, final_code.as_bytes()).context("Failed to write final code to interpreter")?;
-
+/// Main polling loop that proxies data between stdin/stdout and the PTY, and handles SIGWINCH.
+fn proxy_loop(
+    pty_fd: BorrowedFd,
+    stdin_fd: BorrowedFd,
+    stdout_fd: BorrowedFd,
+    mut sigwinch_r: UnixStream
+) -> Result<()> {
     let mut buf = [0u8; 1024];
     let mut stdin_eof = false;
 
@@ -111,7 +125,7 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
             fds.push(PollFd::new(stdin_fd, PollFlags::POLLIN));
         }
 
-        poll(&mut fds, PollTimeout::NONE)?;
+        poll(&mut fds, PollTimeout::NONE).context("Failed to poll file descriptors")?;
 
         let sigwinch_revents = fds[0].revents();
         let pty_revents = fds.get(1).and_then(|f| f.revents());
@@ -121,18 +135,10 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
             None
         };
 
-        drop(fds); // Drop to release borrow on sigwinch_r
-
-        // Now we can safely read from sigwinch_r
+        // Handle SIGWINCH events
         if let Some(revents) = sigwinch_revents {
             if revents.contains(PollFlags::POLLIN) {
-                let mut sigbuf = [0u8; 128];
-                // Read until no more data
-                while let Ok(n) = sigwinch_r.read(&mut sigbuf) {
-                    if n == 0 {
-                        break;
-                    }
-                }
+                drain_all(&mut sigwinch_r).context("Failed to drain SIGWINCH stream")?;
                 if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
                     eprintln!("Failed to sync window size: {}", e);
                 }
@@ -150,11 +156,11 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
                     // Interpreter exited
                     break;
                 }
-                // Write to stdout
-                // For simplicity, no retry logic here, just a single write
-                // Typically fine for a TTY
-                let _ = stdout.lock().write_all(&buf[..n]);
-                let _ = stdout.lock().flush();
+                {
+                    let mut stdout_locked = std::io::stdout().lock();
+                    stdout_locked.write_all(&buf[..n])?;
+                    stdout_locked.flush()?;
+                }
             }
         }
 
@@ -162,7 +168,7 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
         if !stdin_eof {
             if let Some(revents) = stdin_revents {
                 if revents.contains(PollFlags::POLLIN) {
-                    let n = match stdin.lock().read(&mut buf) {
+                    let n = match std::io::stdin().lock().read(&mut buf) {
                         Ok(n) => n,
                         Err(_) => 0,
                     };
@@ -177,6 +183,38 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+/// Entrypoint for setting up and running the terminal proxy.
+pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_fd = stdin.as_fd();
+    let stdout_fd = stdout.as_fd();
+
+    // Set raw mode on the user’s terminal with guard
+    let _mode_guard = setup_terminal_mode(stdin_fd)?;
+
+    // Set up signal handling for SIGWINCH
+    let sigwinch_r = setup_sigwinch_stream()?;
+
+    // Sync window size initially
+    if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
+        eprintln!("Failed to sync window size: {}", e);
+    }
+
+    // Write code to interpreter
+    write_all(pty_fd, final_code.as_bytes()).context("Failed to write final code to interpreter")?;
+
+    // Run the polling loop
+    proxy_loop(
+        pty_fd,
+        stdin_fd,
+        stdout_fd,
+        sigwinch_r
+    )?;
 
     // Terminal mode will be restored by _mode_guard on drop.
     Ok(())
