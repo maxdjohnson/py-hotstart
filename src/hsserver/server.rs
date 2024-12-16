@@ -1,23 +1,18 @@
-use anyhow::{Context, Result, bail};
-use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
-use nix::libc;
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
-use nix::sys::stat::Mode;
-use nix::unistd::{fork, ForkResult, setsid, dup2, getpid, execvp, tcsetpgrp, close};
-use std::ffi::CString;
-use std::str::FromStr;
-use std::fs;
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use std::io::{Read, Write, IoSlice};
-use nix::unistd::Pid;
-use std::os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd};
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, open, OFlag};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixStream, UnixListener};
-use std::path::Path;
-use signal_hook::low_level::pipe;
-use signal_hook::consts::{SIGCHLD, SIGTERM, SIGINT};
 use crate::hsserver::supervisor::{ChildId, Supervisor};
+use anyhow::{bail, Context, Result};
+use nix::libc;
+use nix::pty::PtyMaster;
+use nix::sys::select::{select, FdSet};
+use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
+use signal_hook::low_level::pipe;
+use std::fs;
+use std::io::{IoSlice, Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::str::FromStr;
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
@@ -40,12 +35,14 @@ struct ServerState {
 
 impl ServerState {
     fn new() -> Result<ServerState> {
-        let (sigchld_fd, sigterm_fd)= {
+        let (sigchld_fd, sigterm_fd) = {
             let (sigchld_r, sigchld_w) = UnixStream::pair()?;
             let (sigterm_r, sigterm_w) = UnixStream::pair()?;
             let sigint_w = sigterm_w.try_clone()?;
             for socket in &[&sigchld_r, &sigchld_w, &sigterm_r, &sigterm_w, &sigint_w] {
-                let _ = socket.set_nonblocking(true).context("Failed to set socket to non-blocking")?;
+                let _ = socket
+                    .set_nonblocking(true)
+                    .context("Failed to set socket to non-blocking")?;
             }
             pipe::register(SIGCHLD, sigchld_w)?;
             pipe::register(SIGTERM, sigterm_w)?;
@@ -57,9 +54,8 @@ impl ServerState {
             fs::remove_file(SOCKET_PATH).ok();
         }
 
-        let listener = UnixListener::bind(SOCKET_PATH)
-            .context("Failed to bind Unix domain socket")?;
-        debug_assert!(has_cloexec(listener.as_raw_fd()), "O_CLOEXEC not set on listener");
+        let listener =
+            UnixListener::bind(SOCKET_PATH).context("Failed to bind Unix domain socket")?;
 
         let mut perms = fs::metadata(SOCKET_PATH)?.permissions();
         // Adjust permissions if needed (e.g. 0700)
@@ -76,61 +72,91 @@ impl ServerState {
         })
     }
 
-    fn spawn_interpreter(&mut self) -> Result<()> {
-        let (id, fd )= self.supervisor.spawn_interpreter(self.prelude_code.as_deref())?;
-        self.current_interpreter = Some(InterpreterState{id, pty_master_fd: fd});
-        Ok(())
-    }
-
-    fn handle_take(&mut self, stream: &mut UnixStream) -> Result<()> {
-        if let Some(interp) =  {
-            // Send the FD to the client
-        } else {
-            // No interpreter ready
-            stream.write_all(b"ERROR")?;
+    fn ensure_interpreter(&mut self) -> Result<()> {
+        if self.current_interpreter.is_none() {
+            let (id, fd) = self
+                .supervisor
+                .spawn_interpreter(self.prelude_code.as_deref())?;
+            self.current_interpreter = Some(InterpreterState {
+                id,
+                pty_master_fd: fd,
+            });
         }
         Ok(())
     }
-
-    fn handle_exitcode_request(&mut self, id_str: &str, stream: &mut UnixStream) -> Result<()> {
-        Ok(())
-    }
-
 
     fn run(&mut self) -> Result<()> {
-        self.spawn_interpreter()?;
+        self.ensure_interpreter()?;
 
         loop {
-            // Accept a connection
-            let (mut stream, _addr) = match self.listener.accept() {
-                Ok(pair) => pair,
+            match self.run_one() {
+                Ok(false) => break,
+                Ok(true) => {}
                 Err(e) => {
-                    // If accept fails, just log and continue
-                    eprintln!("Accept failed: {}", e);
-                    continue;
+                    eprintln!("error occurred during serve loop: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-            };
-            debug_assert!(has_cloexec(stream.as_raw_fd()), "O_CLOEXEC not set on stream");
-
-            // Handle requests in a separate block so we can use the ? operator more easily
-            // and catch errors to send back to client.
-            if let Err(err) = self.handle(&mut stream) {
-                // If we get here, an error occurred
-                eprintln!("Error handling request: {:?}", err);
-
-                // Attempt to send an error message back to the client
-                // Note: The client might have already closed the connection or
-                // we might fail again, but we'll try gracefully.
-                let err_msg = format!("ERROR: {}\n", err);
-                let _ = stream.write_all(err_msg.as_bytes());
-
-                // Continue with next iteration of the loop (keep listening)
-                continue;
             }
         }
+        Ok(())
     }
 
-    fn handle(&mut self, mut stream: &mut UnixStream) -> Result<()> {
+    fn run_one(&mut self) -> Result<bool> {
+        // Wait for input or signal
+        let (listener_ready, sigchld_ready, sigterm_ready) = {
+            let listener_fd = self.listener.as_fd();
+            let sigchld_fd = self.sigchld_fd.as_fd();
+            let sigterm_fd = self.sigterm_fd.as_fd();
+            let mut readfds = FdSet::new();
+            readfds.insert(listener_fd);
+            readfds.insert(sigchld_fd);
+            readfds.insert(sigterm_fd);
+
+            let ready = select(None, &mut readfds, None, None, None)?;
+            if ready == 0 {
+                (false, false, false)
+            } else {
+                (
+                    readfds.contains(listener_fd),
+                    readfds.contains(sigchld_fd),
+                    readfds.contains(sigterm_fd),
+                )
+            }
+        };
+
+        if sigchld_ready {
+            let mut buf = [0u8; 64];
+            while let Ok(n) = self.sigchld_fd.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            self.supervisor.handle_sigchld()?;
+        }
+
+        if sigterm_ready {
+            let mut buf = [0u8; 64];
+            while let Ok(n) = self.sigterm_fd.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            eprintln!("Received SIGTERM or SIGINT, shutting down gracefully.");
+            return Ok(false);
+        }
+
+        if listener_ready {
+            let (mut stream, _addr) = self.listener.accept().context("accept failed")?;
+            if let Err(err) = self.handle(&mut stream) {
+                eprintln!("Error handling request: {:?}", err);
+                let err_msg = format!("ERROR: {}\n", err);
+                let _ = stream.write_all(err_msg.as_bytes());
+            }
+        }
+        Ok(true)
+    }
+
+    fn handle(&mut self, stream: &mut UnixStream) -> Result<()> {
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf).context("Failed to read request")?;
         if n == 0 {
@@ -141,14 +167,20 @@ impl ServerState {
         let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
         if req.starts_with("INIT ") {
-            // Restart the current interpreter
+            // Update prelude
             let prelude = req.strip_prefix("INIT ").unwrap();
-            if let Some(interp) = &self.current_interpreter {
-                graceful_kill(interp.id.get_pid())?;
-            }
             self.prelude_code = Some(prelude.to_string());
-            self.spawn_interpreter()?;
-            stream.write_all(b"OK").context("Failed to write response")?;
+
+            // Kill current interpreter (if present)
+            if let Some(interp) = &self.current_interpreter {
+                self.supervisor.kill(interp.id)?;
+            }
+
+            // Start new interpreter
+            self.ensure_interpreter()?;
+            stream
+                .write_all(b"OK")
+                .context("Failed to write response")?;
         } else if req == "TAKE" {
             // Take the interpreter and return it
             let interp = self.current_interpreter.take().context("no interpreter")?;
@@ -156,16 +188,19 @@ impl ServerState {
             let iov = [IoSlice::new(response.as_bytes())];
             let fds = [interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
-            sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).context("Failed to sendmsg")?;
+            sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+                .context("Failed to sendmsg")?;
 
             // Spawn a new interpreter for next request
-            self.spawn_interpreter()?;
+            self.ensure_interpreter()?;
         } else if req.starts_with("EXITCODE ") {
-            // Get exit code from supervisor
+            // Return exit code from supervisor
             let id_str = req.strip_prefix("EXITCODE ").unwrap();
-            let child_id = ChildId::from_str(id_str.trim()).with_context(|| format!("child_id='{}'", id_str))?;
+            let child_id = ChildId::from_str(id_str.trim())
+                .with_context(|| format!("child_id='{}'", id_str))?;
             let exit_code = self.supervisor.get_exit_code(child_id)?;
-            stream.write_all(format!("OK {}", exit_code).as_bytes())
+            stream
+                .write_all(format!("OK {}", exit_code).as_bytes())
                 .context("Failed to write exit code response")?;
         } else {
             bail!("Unknown command '{}'", req)
@@ -179,49 +214,4 @@ fn main() -> Result<()> {
     let mut server = ServerState::new()?;
     server.run()?;
     Ok(())
-}
-
-
-fn graceful_kill(pid: Pid) -> Result<WaitStatus> {
-    // Send SIGTERM to request graceful termination
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGTERM);
-
-    // Check if the process ends gracefully within a timeout
-    // We'll do a simple retry loop with sleeps. In a real application,
-    // you might use more precise timing or asynchronous I/O.
-    use std::time::{Duration, Instant};
-    let start = Instant::now();
-    let timeout = Duration::from_secs(2);
-
-    let mut status = WaitStatus::StillAlive;
-    while start.elapsed() < timeout {
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => {
-                // Not exited yet, wait a bit longer
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(_status) => {
-                // Interpreter has exited
-                status = _status;
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error waiting for interpreter to exit: {}", e);
-                break;
-            }
-        }
-    }
-
-    if status != WaitStatus::StillAlive {
-        // Still running after graceful timeout, send SIGKILL
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
-        // Now wait without WNOHANG since SIGKILL should terminate it quickly
-        status = waitpid(pid, None).unwrap_or(status);
-    }
-    Ok(status)
-}
-
-fn has_cloexec(read_fd: RawFd) -> bool {
-    let read_flags = fcntl(read_fd, FcntlArg::F_GETFD).expect("Failed to get flags");
-    FdFlag::from_bits_truncate(read_flags).contains(FdFlag::FD_CLOEXEC)
 }
