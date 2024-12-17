@@ -70,7 +70,7 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
     let mut pty_fd: Option<OwnedFd> = None;
     for cmsg in msg.cmsgs()? {
         if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            pty_fd = fds.get(0).map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+            pty_fd = fds.first().map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
         }
     }
     let resp_str = String::from_utf8_lossy(&iov[0]);

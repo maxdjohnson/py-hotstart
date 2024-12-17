@@ -55,7 +55,7 @@ impl ServerState {
             let (sigterm_r, sigterm_w) = UnixStream::pair()?;
             let sigint_w = sigterm_w.try_clone()?;
             for socket in &[&sigchld_r, &sigchld_w, &sigterm_r, &sigterm_w, &sigint_w] {
-                let _ = socket
+                socket
                     .set_nonblocking(true)
                     .context("Failed to set socket to non-blocking")?;
             }

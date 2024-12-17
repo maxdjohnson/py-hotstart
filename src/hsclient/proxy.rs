@@ -155,10 +155,7 @@ fn proxy_loop(
         // Check PTY for output
         if let Some(revents) = pty_revents {
             if revents.contains(PollFlags::POLLIN) {
-                let n = match read(pty_fd.as_raw_fd(), &mut buf) {
-                    Ok(n) => n,
-                    Err(_) => 0,
-                };
+                let n = read(pty_fd.as_raw_fd(), &mut buf).unwrap_or(0);
                 if n == 0 {
                     // Interpreter exited
                     break;
@@ -175,10 +172,7 @@ fn proxy_loop(
         if !stdin_eof {
             if let Some(revents) = stdin_revents {
                 if revents.contains(PollFlags::POLLIN) {
-                    let n = match std::io::stdin().lock().read(&mut buf) {
-                        Ok(n) => n,
-                        Err(_) => 0,
-                    };
+                    let n = std::io::stdin().lock().read(&mut buf).unwrap_or(0);
                     if n == 0 {
                         // EOF on stdin - close write side to PTY
                         let _ = close(pty_fd.as_raw_fd());
