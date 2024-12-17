@@ -1,22 +1,21 @@
-use anyhow::{Context, Result, bail};
-use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
-use std::os::fd::{OwnedFd, FromRawFd};
-use std::os::unix::net::UnixStream;
-use std::io::IoSliceMut;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::io::{Read, Write};
+use anyhow::{bail, Context, Result};
 use nix::cmsg_space;
+use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+use std::io::IoSliceMut;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 
 const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 
 pub struct ClientInterpreter {
     pub id: String,
-    pub pty_master_fd: OwnedFd
+    pub pty_master_fd: OwnedFd,
 }
 
 fn send_request(req: &str) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .context("Failed to connect to server")?;
+    let mut stream = UnixStream::connect(SOCKET_PATH).context("Failed to connect to server")?;
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
     Ok(stream)
@@ -45,7 +44,8 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
         &mut iov,
         Some(&mut cmsgspace),
         MsgFlags::empty(),
-    ).context("Failed to recvmsg")?;
+    )
+    .context("Failed to recvmsg")?;
 
     if msg.bytes == 0 {
         bail!("No data received from server");
@@ -59,9 +59,14 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
     }
     let resp_str = String::from_utf8_lossy(&iov[0]);
 
-    let id = resp_str.strip_prefix("OK ").with_context(|| format!("invalid response {}", resp_str))?;
+    let id = resp_str
+        .strip_prefix("OK ")
+        .with_context(|| format!("invalid response {}", resp_str))?;
     let pty_fd_value = pty_fd.context("missing fd")?;
-    Ok(ClientInterpreter { id: id.to_string(), pty_master_fd: pty_fd_value })
+    Ok(ClientInterpreter {
+        id: id.to_string(),
+        pty_master_fd: pty_fd_value,
+    })
 }
 
 pub fn get_exit_code(interpreter: &ClientInterpreter) -> Result<i32> {
@@ -70,5 +75,6 @@ pub fn get_exit_code(interpreter: &ClientInterpreter) -> Result<i32> {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;
     let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-    resp.parse::<i32>().context("Failed to parse exit code from server")
+    resp.parse::<i32>()
+        .context("Failed to parse exit code from server")
 }

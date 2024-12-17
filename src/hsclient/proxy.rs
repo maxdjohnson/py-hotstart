@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use std::io::{Read, Write};
 use nix::libc;
-use nix::sys::termios::{tcgetattr, tcsetattr, Termios, SetArg, cfmakeraw};
-use nix::unistd::{read, write, close};
-use std::os::fd::{BorrowedFd, AsFd, AsRawFd};
-use std::os::unix::net::UnixStream;
-use signal_hook::low_level::pipe;
-use signal_hook::consts::SIGWINCH;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
+use nix::unistd::{close, read, write};
+use signal_hook::consts::SIGWINCH;
+use signal_hook::low_level::pipe;
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::net::UnixStream;
 
 // Create wrappers for TIOCGWINSZ and TIOCSWINSZ
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
@@ -30,7 +30,10 @@ impl TerminalModeGuard {
 
         // Extend lifetime of fd borrow by making it 'static.
         let fd_static: BorrowedFd<'static> = unsafe { std::mem::transmute(fd) };
-        Ok(TerminalModeGuard { fd: fd_static, original })
+        Ok(TerminalModeGuard {
+            fd: fd_static,
+            original,
+        })
     }
 }
 
@@ -61,8 +64,7 @@ fn sync_winsize(from_fd: BorrowedFd, to_fd: BorrowedFd) -> Result<()> {
         };
     }
 
-    unsafe { tiocswinsz(to_fd.as_raw_fd(), &ws) }
-        .context("failed to set winsize")?;
+    unsafe { tiocswinsz(to_fd.as_raw_fd(), &ws) }.context("failed to set winsize")?;
 
     Ok(())
 }
@@ -89,9 +91,14 @@ fn setup_terminal_mode(stdin_fd: BorrowedFd) -> Result<TerminalModeGuard> {
 
 /// Set up SIGWINCH signal handling via a UnixStream pair and register with signal_hook.
 fn setup_sigwinch_stream() -> Result<UnixStream> {
-    let (sigwinch_r, sigwinch_w) = UnixStream::pair().context("Failed to create UnixStream pair for signals")?;
-    sigwinch_r.set_nonblocking(true).context("Failed to set sigwinch_r to non-blocking")?;
-    sigwinch_w.set_nonblocking(true).context("Failed to set sigwinch_w to non-blocking")?;
+    let (sigwinch_r, sigwinch_w) =
+        UnixStream::pair().context("Failed to create UnixStream pair for signals")?;
+    sigwinch_r
+        .set_nonblocking(true)
+        .context("Failed to set sigwinch_r to non-blocking")?;
+    sigwinch_w
+        .set_nonblocking(true)
+        .context("Failed to set sigwinch_w to non-blocking")?;
     pipe::register(SIGWINCH, sigwinch_w).context("Failed to register SIGWINCH with pipe")?;
     Ok(sigwinch_r)
 }
@@ -112,7 +119,7 @@ fn proxy_loop(
     pty_fd: BorrowedFd,
     stdin_fd: BorrowedFd,
     stdout_fd: BorrowedFd,
-    mut sigwinch_r: UnixStream
+    mut sigwinch_r: UnixStream,
 ) -> Result<()> {
     let mut buf = [0u8; 1024];
     let mut stdin_eof = false;
@@ -206,15 +213,11 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
     }
 
     // Write code to interpreter
-    write_all(pty_fd, final_code.as_bytes()).context("Failed to write final code to interpreter")?;
+    write_all(pty_fd, final_code.as_bytes())
+        .context("Failed to write final code to interpreter")?;
 
     // Run the polling loop
-    proxy_loop(
-        pty_fd,
-        stdin_fd,
-        stdout_fd,
-        sigwinch_r
-    )?;
+    proxy_loop(pty_fd, stdin_fd, stdout_fd, sigwinch_r)?;
 
     // Terminal mode will be restored by _mode_guard on drop.
     Ok(())

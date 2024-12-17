@@ -1,5 +1,5 @@
-mod hsserver;
 mod hsclient;
+mod hsserver;
 
 fn main() {
     match hsclient::cli::main() {
