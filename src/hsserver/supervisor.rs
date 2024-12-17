@@ -32,11 +32,11 @@ impl fmt::Display for ChildId {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ParseChildIdError;
+pub struct ParseChildIdError(String);
 
 impl std::fmt::Display for ParseChildIdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid ChildId")
+        write!(f, "invalid ChildId: {:?}", self.0)
     }
 }
 
@@ -50,10 +50,10 @@ impl FromStr for ChildId {
             .strip_prefix('(')
             .and_then(|s| s.strip_suffix(')'))
             .and_then(|s| s.split_once(','))
-            .ok_or(ParseChildIdError)?;
+            .ok_or_else(|| ParseChildIdError(s.to_string()))?;
 
-        let id = x.parse::<u32>().map_err(|_| ParseChildIdError)?;
-        let pid = y.parse::<libc::pid_t>().map_err(|_| ParseChildIdError)?;
+        let id = x.parse::<u32>().map_err(|_| ParseChildIdError(s.to_string()))?;
+        let pid = y.parse::<libc::pid_t>().map_err(|_| ParseChildIdError(s.to_string()))?;
 
         Ok(ChildId {
             id,

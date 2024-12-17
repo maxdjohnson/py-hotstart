@@ -55,33 +55,34 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
     let mut iov = [IoSliceMut::new(&mut buf)];
     let mut cmsgspace = cmsg_space!([RawFd; 1]);
 
-    let msg = recvmsg::<()>(
-        stream.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsgspace),
-        MsgFlags::empty(),
-    )
-    .context("Failed to recvmsg")?;
-
-    if msg.bytes == 0 {
-        bail!("No data received from server");
-    }
-
-    let mut pty_fd: Option<OwnedFd> = None;
-    for cmsg in msg.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            pty_fd = fds.first().map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+    let (n, pty_fd) = {
+        let msg = recvmsg::<()>(
+            stream.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsgspace),
+            MsgFlags::empty(),
+        )
+        .context("Failed to recvmsg")?;
+        if msg.bytes == 0 {
+            bail!("No message in response");
         }
-    }
-    let resp_str = String::from_utf8_lossy(&iov[0]);
+        let mut pty_fd: Option<OwnedFd> = None;
+        for cmsg in msg.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                pty_fd = fds.first().map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) });
+                break;
+            }
+        }
+        (msg.bytes, pty_fd.context("No fd in response")?)
+    };
 
+    let resp_str = String::from_utf8_lossy(&iov[0][..n]);
     let id = resp_str
         .strip_prefix("OK ")
         .with_context(|| format!("invalid response {}", resp_str))?;
-    let pty_fd_value = pty_fd.context("missing fd")?;
     Ok(ClientInterpreter {
         id: id.to_string(),
-        pty_master_fd: pty_fd_value,
+        pty_master_fd: pty_fd,
     })
 }
 
@@ -91,6 +92,8 @@ pub fn get_exit_code(interpreter: &ClientInterpreter) -> Result<i32> {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;
     let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-    resp.parse::<i32>()
+    let exit_code = resp.strip_prefix("OK ")
+        .with_context(|| format!("unexpected exit code response {}", resp))?;
+    exit_code.parse::<i32>()
         .context("Failed to parse exit code from server")
 }

@@ -175,8 +175,8 @@ impl ServerState {
             // Client closed connection; just continue
             return Ok(());
         }
-
-        let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        eprintln!("Received request: {:?}", req);
 
         if req.starts_with("INIT ") {
             // Update prelude
@@ -190,8 +190,10 @@ impl ServerState {
 
             // Start new interpreter
             self.ensure_interpreter()?;
+            let response = "OK";
+            eprintln!("Responding: {:?}", response);
             stream
-                .write_all(b"OK")
+                .write_all(response.as_bytes())
                 .context("Failed to write response")?;
         } else if req == "TAKE" {
             // Take the interpreter and return it
@@ -205,6 +207,7 @@ impl ServerState {
             let iov = [IoSlice::new(response.as_bytes())];
             let fds = [interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
+            eprintln!("Responding: {:?}", response);
             sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
                 .context("Failed to sendmsg")?; // TODO: eintr
             // Purposefully keep the reference until _after_ it's successfully sent to cli
@@ -215,11 +218,12 @@ impl ServerState {
         } else if req.starts_with("EXITCODE ") {
             // Return exit code from supervisor
             let id_str = req.strip_prefix("EXITCODE ").unwrap();
-            let child_id = ChildId::from_str(id_str.trim())
-                .with_context(|| format!("child_id='{}'", id_str))?;
+            let child_id = ChildId::from_str(id_str.trim())?;
             let exit_code = self.supervisor.get_exit_code(child_id)?;
+            let response = format!("OK {}", exit_code);
+            eprintln!("Responding: {:?}", response);
             stream
-                .write_all(format!("OK {}", exit_code).as_bytes())
+                .write_all(response.as_bytes())
                 .context("Failed to write exit code response")?;
         } else {
             bail!("Unknown command '{}'", req)
