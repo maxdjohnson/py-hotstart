@@ -1,3 +1,4 @@
+use crate::hsserver::server::{ensure, SOCKET_PATH};
 use anyhow::{bail, Context, Result};
 use nix::cmsg_space;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
@@ -7,11 +8,26 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
-
 pub struct ClientInterpreter {
     pub id: String,
     pub pty_master_fd: OwnedFd,
+}
+
+pub fn ensure_server() -> Result<()> {
+    ensure()?;
+
+    // Wait for socket to be created
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(1) {
+        if std::path::Path::new(SOCKET_PATH).exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !std::path::Path::new(SOCKET_PATH).exists() {
+        bail!("Timed out waiting for server to start");
+    }
+    Ok(())
 }
 
 fn send_request(req: &str) -> Result<UnixStream> {

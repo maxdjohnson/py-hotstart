@@ -66,9 +66,6 @@ impl ChildId {
     fn new(id: u32, pid: Pid) -> Self {
         ChildId { id, pid }
     }
-    pub fn get_pid(&self) -> Pid {
-        self.pid
-    }
 }
 
 pub struct Supervisor {
@@ -280,12 +277,10 @@ impl Interpreter {
 
                 // Prepare python command
                 let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
-                std::fs::write(SCRIPT_PATH, script_with_prelude).context("Failed to write to temp file")?;
+                std::fs::write(SCRIPT_PATH, script_with_prelude)
+                    .context("Failed to write to temp file")?;
                 let python = CString::new("python3").unwrap();
-                let args = [
-                    python.clone(),
-                    CString::new(SCRIPT_PATH).unwrap(),
-                ];
+                let args = [python.clone(), CString::new(SCRIPT_PATH).unwrap()];
                 execvp(&python, &args).expect("execvp failed");
                 unreachable!()
             }

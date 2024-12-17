@@ -1,15 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
 use clap::{Arg, ArgAction, Command};
+use std::collections::HashMap;
 use std::os::fd::AsFd;
-use std::{env, fs, process};
+use std::env;
 
-use crate::hsclient::client::{get_exit_code, initialize, take_interpreter};
+use crate::hsclient::client::{get_exit_code, initialize, take_interpreter, ensure_server};
 use crate::hsclient::proxy::do_proxy;
 
 enum Args {
     Init(String),
-    Run(RunMode)
+    Run(RunMode),
 }
 
 enum RunMode {
@@ -57,7 +57,7 @@ fn parse_args() -> Result<Args> {
         .get_one::<String>("initialize")
         .map(|s| s.to_string());
     if let Some(code) = prelude {
-        return Ok(Args::Init(code))
+        return Ok(Args::Init(code));
     }
 
     let code_mode = matches.get_one::<String>("code");
@@ -96,21 +96,27 @@ fn generate_instructions(run_mode: RunMode) -> Result<String> {
             format!("exec({:?}, {{**globals(), '__name__':'__main__'}})", snip),
         ),
         RunMode::Module(module_str, mut script_args) => {
-            let snip = format!("import runpy; runpy.run_module({:?}, run_name='__main__', alter_sys=True)", &module_str);
+            let snip = format!(
+                "import runpy; runpy.run_module({:?}, run_name='__main__', alter_sys=True)",
+                &module_str
+            );
             script_args.insert(0, module_str);
-            ( script_args, snip)
+            (script_args, snip)
         }
         RunMode::Script(script_path, mut script_args) => {
-            let snip = format!("import runpy; runpy.run_path({:?}, run_name='__main__')", &script_path);
+            let snip = format!(
+                "import runpy; runpy.run_path({:?}, run_name='__main__')",
+                &script_path
+            );
             script_args.insert(0, script_path);
-            ( script_args, snip)
+            (script_args, snip)
         }
         RunMode::Repl => (
             vec!["".to_string()],
             "import code; code.interact(local={}, exitmsg='')".to_string(),
-        )
+        ),
     };
-    let argv_str= json::stringify(argv);
+    let argv_str = json::stringify(argv);
 
     let instructions = format!(
         r#"import sys, os
@@ -128,6 +134,7 @@ sys.argv.extend({argv_str})
 }
 
 pub fn main() -> Result<i32> {
+    ensure_server()?;
     let args = parse_args()?;
     match args {
         Args::Init(prelude_script) => {

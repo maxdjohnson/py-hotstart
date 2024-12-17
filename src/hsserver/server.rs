@@ -1,9 +1,11 @@
+use crate::hsserver::daemon::{daemonize, PidFileGuard};
 use crate::hsserver::supervisor::{ChildId, Supervisor};
 use anyhow::{bail, Context, Result};
 use nix::libc;
 use nix::pty::PtyMaster;
 use nix::sys::select::{select, FdSet};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::unistd::{ForkResult, Pid};
 use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
 use signal_hook::low_level::pipe;
 use std::fs;
@@ -11,13 +13,15 @@ use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process;
 use std::str::FromStr;
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
-const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
+pub const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
+const PIDFILE_PATH: &str = "/tmp/py_hotstart.pid";
 const PY_STOP_SUPERVISION: &str = "__py_hotstart_supervised__ == False";
 
 struct InterpreterState {
@@ -36,6 +40,13 @@ struct ServerState {
 
 impl ServerState {
     fn new() -> Result<ServerState> {
+        if Path::new(SOCKET_PATH).exists() {
+            fs::remove_file(SOCKET_PATH).ok();
+        }
+
+        let listener =
+            UnixListener::bind(SOCKET_PATH).context("Failed to bind Unix domain socket")?;
+
         let (sigchld_fd, sigterm_fd) = {
             let (sigchld_r, sigchld_w) = UnixStream::pair()?;
             let (sigterm_r, sigterm_w) = UnixStream::pair()?;
@@ -50,13 +61,6 @@ impl ServerState {
             pipe::register(SIGINT, sigint_w)?;
             (sigchld_r, sigterm_r)
         };
-
-        if Path::new(SOCKET_PATH).exists() {
-            fs::remove_file(SOCKET_PATH).ok();
-        }
-
-        let listener =
-            UnixListener::bind(SOCKET_PATH).context("Failed to bind Unix domain socket")?;
 
         let mut perms = fs::metadata(SOCKET_PATH)?.permissions();
         // Adjust permissions if needed (e.g. 0700)
@@ -184,7 +188,10 @@ impl ServerState {
                 .context("Failed to write response")?;
         } else if req == "TAKE" {
             // Take the interpreter and return it
-            let mut interp = self.current_interpreter.as_mut().context("no interpreter")?;
+            let interp = self
+                .current_interpreter
+                .as_mut()
+                .context("no interpreter")?;
             writeln!(interp.pty_master_fd, "{}", PY_STOP_SUPERVISION.trim())
                 .context("Failed to write to interpreter tty")?;
             let response = format!("OK {}", interp.id);
@@ -215,7 +222,26 @@ impl ServerState {
     }
 }
 
-fn main() -> Result<()> {
+pub fn ensure() -> Result<()> {
+    if PidFileGuard::test(PIDFILE_PATH)?.is_some() {
+        return Ok(());
+    }
+    // Spawn daemon process and return
+    if let ForkResult::Child = daemonize()? {
+        if let Err(e) = serve() {
+            eprintln!("Server error {e}");
+            process::exit(1);
+        }
+        process::exit(0);
+    }
+    Ok(())
+}
+
+fn serve() -> Result<()> {
+    let pid = Pid::this();
+    let pidfile: PathBuf = PIDFILE_PATH.into();
+    let _pidfile_guard = PidFileGuard::new(pid, &pidfile)
+        .with_context(move || format!("pid={} file={}", pid, pidfile.to_string_lossy()))?;
     let mut server = ServerState::new()?;
     server.run()?;
     Ok(())
