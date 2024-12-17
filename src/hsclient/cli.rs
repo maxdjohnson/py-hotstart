@@ -6,8 +6,10 @@ use std::env;
 
 use crate::hsclient::client::{get_exit_code, initialize, take_interpreter, ensure_server};
 use crate::hsclient::proxy::do_proxy;
+use crate::hsserver::server::restart;
 
 enum Args {
+    Restart,
     Init(String),
     Run(RunMode),
 }
@@ -21,6 +23,12 @@ enum RunMode {
 
 fn parse_args() -> Result<Args> {
     let matches = Command::new("py-hotstart")
+        .arg(
+            Arg::new("restart")
+                .long("restart")
+                .action(ArgAction::SetTrue)
+                .help("Kill existing server and start a new one"),
+        )
         .arg(
             Arg::new("initialize")
                 .short('i')
@@ -53,6 +61,9 @@ fn parse_args() -> Result<Args> {
         .after_help("Usage: py-hotstart [options] [-c cmd | -m module | script.py] [args]")
         .get_matches();
 
+    if matches.get_one::<bool>("restart").is_some() {
+        return Ok(Args::Restart);
+    }
     let prelude = matches
         .get_one::<String>("initialize")
         .map(|s| s.to_string());
@@ -137,6 +148,10 @@ pub fn main() -> Result<i32> {
     ensure_server()?;
     let args = parse_args()?;
     match args {
+        Args::Restart => {
+            restart()?;
+            Ok(0)
+        }
         Args::Init(prelude_script) => {
             initialize(&prelude_script)?;
             Ok(0)

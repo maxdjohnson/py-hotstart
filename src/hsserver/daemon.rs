@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
+use nix::sys::signal::Signal;
+use std::time::{Duration, Instant};
 use nix::fcntl::{open, OFlag};
 use nix::libc;
 use nix::sys::signal::kill;
@@ -95,9 +97,10 @@ impl PidFileGuard {
         if path.as_ref().exists() {
             let contents = read_to_string(path.as_ref())?;
             let pid_str = contents.trim();
-            if let Ok(other_pid) = pid_str.parse::<i32>() {
+            if let Ok(pid_raw) = pid_str.parse::<i32>() {
+                let other_pid = Pid::from_raw(pid_raw);
                 if process_is_alive(other_pid)? {
-                    return Ok(Some(Pid::from_raw(other_pid)));
+                    return Ok(Some(other_pid));
                 }
             }
             // Otherwise, treat it as stale PID file
@@ -144,8 +147,37 @@ impl Drop for PidFileGuard {
     }
 }
 
-fn process_is_alive(pid: i32) -> Result<bool> {
-    match kill(Pid::from_raw(pid), None) {
+pub fn kill_with_timeout(pid: Pid, timeout: Duration) -> Result<()> {
+    // Send SIGTERM first
+    kill_if_alive(pid, Signal::SIGTERM)?;
+
+    // Wait up to 'timeout' for the process to die
+    let start = Instant::now();
+
+    // Wait for child to exit
+    while start.elapsed() < timeout {
+        if !process_is_alive(pid)? {
+            // Process exited in time
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // If still alive, send SIGKILL
+    kill_if_alive(pid, Signal::SIGKILL)?;
+    Ok(())
+}
+
+fn kill_if_alive(pid: Pid, signal: Signal) -> Result<()> {
+    match kill(pid, Some(signal)) {
+        Ok(_) => Ok(()),
+        Err(Errno::ESRCH) => Ok(()),
+        Err(e) => Err(anyhow!("kill_if_alive: kill error {}", e)),
+    }
+}
+
+fn process_is_alive(pid: Pid) -> Result<bool> {
+    match kill(pid, None) {
         Ok(_) => Ok(true),
         Err(Errno::ESRCH) => Ok(false),
         Err(e) => Err(anyhow!("process_is_alive: kill error {}", e)),

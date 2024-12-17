@@ -287,3 +287,48 @@ impl Interpreter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_child_id_display_parse() {
+        let id = 2;
+        let pid = Pid::from_raw(81581);
+        let child_id = ChildId::new(id, pid);
+        assert_eq!(child_id.id, id);
+        assert_eq!(child_id.pid, pid);
+        let displayed = format!("{}", child_id);
+        assert_eq!(displayed, "(2,81581)");
+        let child_id2 = ChildId::from_str(&displayed).unwrap();
+        assert_eq!(child_id2, child_id);
+    }
+
+    #[test]
+    fn test_child_id_from_str_missing_parentheses() {
+        let inputs = ["123,456", "(123,456", "123,456)", ""];
+
+        for input in inputs {
+            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_child_id_from_str_missing_comma() {
+        let inputs = ["(123 456)", "(123)", "(,456)", "(123,)"];
+
+        for input in inputs {
+            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_child_id_from_str_invalid_numbers() {
+        let inputs = ["(abc,456)", "(123,xyz)", "(abc,xyz)"];
+
+        for input in inputs {
+            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+        }
+    }
+}

@@ -16,6 +16,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
+use std::time::Duration;
+
+use super::daemon::kill_with_timeout;
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
@@ -220,6 +223,15 @@ impl ServerState {
 
         Ok(())
     }
+}
+
+pub fn restart() -> Result<()> {
+    if let Some(pid) = PidFileGuard::test(PIDFILE_PATH)? {
+        kill_with_timeout(pid, Duration::from_secs(2))?;
+        // Attempt to remove the PID file just in case. Errors are ignored.
+        let _ = std::fs::remove_file(PIDFILE_PATH);
+    }
+    ensure()
 }
 
 pub fn ensure() -> Result<()> {
