@@ -1,4 +1,7 @@
+import os  # noqa
+import runpy  # noqa
 import sys
+import termios  # noqa
 
 if sys.path[0] == "":
     del sys.path[0]

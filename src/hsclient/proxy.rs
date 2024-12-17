@@ -15,13 +15,13 @@ nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
 
 /// RAII guard for terminal mode restoration.
-struct TerminalModeGuard {
+pub struct TerminalModeGuard {
     fd: BorrowedFd<'static>,
     original: Termios,
 }
 
 impl TerminalModeGuard {
-    fn new(fd: BorrowedFd<'_>) -> Result<TerminalModeGuard> {
+    pub fn new(fd: BorrowedFd<'_>) -> Result<TerminalModeGuard> {
         let termios = tcgetattr(fd).context("Failed to get terminal attributes")?;
         let original = termios.clone();
         let mut raw = termios;
@@ -34,6 +34,10 @@ impl TerminalModeGuard {
             fd: fd_static,
             original,
         })
+    }
+
+    pub fn get_original(&self) -> &Termios {
+        &self.original
     }
 }
 
@@ -82,11 +86,6 @@ fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
         }
     }
     Ok(())
-}
-
-/// Setup the terminal in raw mode and return a guard that restores it on drop.
-fn setup_terminal_mode(stdin_fd: BorrowedFd) -> Result<TerminalModeGuard> {
-    TerminalModeGuard::new(stdin_fd)
 }
 
 /// Set up SIGWINCH signal handling via a UnixStream pair and register with signal_hook.
@@ -189,15 +188,12 @@ fn proxy_loop(
     Ok(())
 }
 
-/// Entrypoint for setting up and running the terminal proxy.
+/// Entrypoint for setting up and running the terminal proxy. Expects terminal in raw mode.
 pub fn do_proxy(pty_fd: BorrowedFd, instructions: &str) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stdin_fd = stdin.as_fd();
     let stdout_fd = stdout.as_fd();
-
-    // Set raw mode on the user’s terminal with guard
-    let _mode_guard = setup_terminal_mode(stdin_fd)?;
 
     // Set up signal handling for SIGWINCH
     let sigwinch_r = setup_sigwinch_stream()?;

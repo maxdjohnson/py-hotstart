@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{open, OFlag};
+use nix::sys::termios::{tcgetattr, tcsetattr, cfmakeraw, SetArg};
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::sys::stat::Mode;
@@ -9,6 +10,7 @@ use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResu
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
+use std::os::fd::BorrowedFd;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -254,12 +256,21 @@ impl Interpreter {
 
                 // Attach tty slave device to stdin, stdout, stderr
                 {
+                    // Open slave fd
                     let slave_fd = open(
                         std::path::Path::new(slave_path),
                         OFlag::O_RDWR,
                         Mode::empty(),
                     )
                     .expect("Failed to open pty slave");
+
+                    // Set raw mode
+                    let slave_fd_ref = unsafe{BorrowedFd::borrow_raw(slave_fd)};
+                    let mut termios = tcgetattr(slave_fd_ref).context("Failed to get terminal attributes")?;
+                    cfmakeraw(&mut termios);
+                    tcsetattr(slave_fd_ref, SetArg::TCSANOW, &termios).context("Failed to set terminal to raw mode")?;
+
+                    // Assign to stdin, stdout, stderr
                     dup2(slave_fd, 0).expect("dup2 stdin failed");
                     dup2(slave_fd, 1).expect("dup2 stdout failed");
                     dup2(slave_fd, 2).expect("dup2 stderr failed");
