@@ -125,12 +125,12 @@ sys.argv = {argv_python_list}
     Ok(format!("{setup_code}\n{run_contents}"))
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<i32> {
     let (prelude, config) = parse_args()?;
 
     if let Some(prelude_script) = prelude {
         initialize(&prelude_script)?;
-        return Ok(());
+        return Ok(0);
     }
 
     let final_code = generate_final_code(&config.exec_mode, &config.script_args)?;
@@ -139,5 +139,5 @@ fn main() -> Result<()> {
     do_proxy(interpreter.pty_master_fd.as_fd(), &final_code)?;
 
     let exit_code = get_exit_code(&interpreter)?;
-    process::exit(exit_code);
+    Ok(exit_code)
 }

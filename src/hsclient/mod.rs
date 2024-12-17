@@ -1,3 +1,3 @@
-mod cli;
-mod client;
-mod proxy;
+pub mod cli;
+pub mod client;
+pub mod proxy;

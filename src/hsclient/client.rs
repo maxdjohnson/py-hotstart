@@ -9,7 +9,7 @@ use nix::cmsg_space;
 
 const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 
-struct ClientInterpreter {
+pub struct ClientInterpreter {
     pub id: String,
     pub pty_master_fd: OwnedFd
 }

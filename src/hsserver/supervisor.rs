@@ -29,7 +29,7 @@ impl fmt::Display for ChildId {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ParseChildIdError;
+pub struct ParseChildIdError;
 
 impl std::fmt::Display for ParseChildIdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
