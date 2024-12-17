@@ -195,7 +195,7 @@ fn proxy_loop(
 }
 
 /// Entrypoint for setting up and running the terminal proxy.
-pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
+pub fn do_proxy(pty_fd: BorrowedFd, instructions: &str) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stdin_fd = stdin.as_fd();
@@ -212,9 +212,10 @@ pub fn do_proxy(pty_fd: BorrowedFd, final_code: &str) -> Result<()> {
         eprintln!("Failed to sync window size: {}", e);
     }
 
-    // Write code to interpreter
-    write_all(pty_fd, final_code.as_bytes())
-        .context("Failed to write final code to interpreter")?;
+    // Write instructions to interpreter
+    let instructions_literal = format!("{:?}\n", instructions);
+    write_all(pty_fd, instructions_literal.as_bytes())
+        .context("Failed to write instructions to interpreter")?;
 
     // Run the polling loop
     proxy_loop(pty_fd, stdin_fd, stdout_fd, sigwinch_r)?;

@@ -18,6 +18,7 @@ use std::str::FromStr;
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
+const PY_STOP_SUPERVISION: &str = "__py_hotstart_supervised__ == False";
 
 struct InterpreterState {
     id: ChildId,
@@ -183,13 +184,17 @@ impl ServerState {
                 .context("Failed to write response")?;
         } else if req == "TAKE" {
             // Take the interpreter and return it
-            let interp = self.current_interpreter.take().context("no interpreter")?;
+            let mut interp = self.current_interpreter.as_mut().context("no interpreter")?;
+            writeln!(interp.pty_master_fd, "{}", PY_STOP_SUPERVISION.trim())
+                .context("Failed to write to interpreter tty")?;
             let response = format!("OK {}", interp.id);
             let iov = [IoSlice::new(response.as_bytes())];
             let fds = [interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
             sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
                 .context("Failed to sendmsg")?;
+            // Purposefully keep the reference until _after_ it's successfully sent to cli
+            self.current_interpreter = None;
 
             // Spawn a new interpreter for next request
             self.ensure_interpreter()?;

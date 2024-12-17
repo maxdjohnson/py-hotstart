@@ -12,6 +12,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+const SCRIPT: &str = include_str!("../pyhotstart.py");
+const SCRIPT_PATH: &str = "/tmp/pyhotstart.py";
+
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
@@ -179,7 +182,9 @@ impl Drop for Supervisor {
             .map(|(pid, id)| ChildId::new(*id, *pid))
             .collect();
         for id in child_ids {
-            self.kill(id);
+            if let Err(e) = self.kill(id) {
+                eprintln!("Failed to kill child process {}: {}", id, e);
+            }
         }
     }
 }
@@ -274,17 +279,12 @@ impl Interpreter {
                 tcsetpgrp(std::io::stdin(), pid).expect("tcsetpgrp failed");
 
                 // Prepare python command
+                let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
+                std::fs::write(SCRIPT_PATH, script_with_prelude).context("Failed to write to temp file")?;
                 let python = CString::new("python3").unwrap();
-                let mut cmd =
-                    "import sys; code=sys.stdin.read(); exec(code, {'__name__':'__main__'})"
-                        .to_string();
-                if let Some(code) = prelude_code {
-                    cmd = format!("exec({}); {}", json::stringify(code), cmd);
-                }
                 let args = [
                     python.clone(),
-                    CString::new("-c").unwrap(),
-                    CString::new(cmd).unwrap(),
+                    CString::new(SCRIPT_PATH).unwrap(),
                 ];
                 execvp(&python, &args).expect("execvp failed");
                 unreachable!()
@@ -292,34 +292,3 @@ impl Interpreter {
         }
     }
 }
-
-/*
-use std::fmt;
-use nix::unistd::Pid;
-use std::str::FromStr;
-use nix::pty::PtyMaster;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChildId { }
-
-impl fmt::Display for ChildId {
-    // implementation omitted
-}
-
-impl FromStr for ChildId {
-    // implementation omitted
-}
-
-impl Supervisor {
-    pub fn spawn_interpreter(&mut self, prelude_code: Option<&str>) -> Result<(ChildId, PtyMaster), Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-
-    pub fn get_exit_code(&mut self, child_id: ChildId) -> Result<i32, Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-
-    pub fn handle_sigchld(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        unimplemented!()
-    }
-} */

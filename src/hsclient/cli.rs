@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use clap::{Arg, ArgAction, Command};
 use std::os::fd::AsFd;
 use std::{env, fs, process};
@@ -6,18 +7,19 @@ use std::{env, fs, process};
 use crate::hsclient::client::{get_exit_code, initialize, take_interpreter};
 use crate::hsclient::proxy::do_proxy;
 
-enum ExecMode {
+enum Args {
+    Init(String),
+    Run(RunMode)
+}
+
+enum RunMode {
     Code(String),
-    Module(String),
-    Script(String),
+    Module(String, Vec<String>),
+    Script(String, Vec<String>),
+    Repl,
 }
 
-struct AppConfig {
-    exec_mode: ExecMode,
-    script_args: Vec<String>,
-}
-
-fn parse_args() -> Result<(Option<String>, AppConfig)> {
+fn parse_args() -> Result<Args> {
     let matches = Command::new("py-hotstart")
         .arg(
             Arg::new("initialize")
@@ -54,119 +56,90 @@ fn parse_args() -> Result<(Option<String>, AppConfig)> {
     let prelude = matches
         .get_one::<String>("initialize")
         .map(|s| s.to_string());
+    if let Some(code) = prelude {
+        return Ok(Args::Init(code))
+    }
 
     let code_mode = matches.get_one::<String>("code");
     let module_mode = matches.get_one::<String>("module");
     let script = matches.get_one::<String>("script");
 
-    let script_args: Vec<String> = matches
+    let mut script_args: Vec<String> = matches
         .get_many::<String>("script_args")
         .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
 
-    let exec_mode = if let Some(c) = code_mode {
-        ExecMode::Code(c.to_string())
+    let run_mode = if let Some(c) = code_mode {
+        RunMode::Code(c.to_string())
     } else if let Some(m) = module_mode {
-        ExecMode::Module(m.to_string())
+        if let Some(s) = script {
+            script_args.insert(0, s.to_string());
+        }
+        RunMode::Module(m.to_string(), script_args)
     } else if let Some(s) = script {
-        ExecMode::Script(s.to_string())
+        RunMode::Script(s.to_string(), script_args)
     } else {
-        eprintln!("No code, module, or script provided");
-        process::exit(1);
+        RunMode::Repl
     };
 
-    Ok((
-        prelude,
-        AppConfig {
-            exec_mode,
-            script_args,
-        },
-    ))
+    Ok(Args::Run(run_mode))
 }
 
-fn generate_env_lines() -> String {
-    let mut env_lines = String::new();
-    for (k, v) in env::vars() {
-        let k_esc = k.replace("'", "\\'");
-        let v_esc = v.replace("'", "\\'");
-        env_lines.push_str(&format!("    os.environ['{k_esc}'] = '{v_esc}'\n"));
-    }
-    env_lines
-}
-
-fn generate_final_code(exec_mode: &ExecMode, script_args: &[String]) -> Result<String> {
+fn generate_instructions(run_mode: RunMode) -> Result<String> {
     let cwd = env::current_dir().context("Failed to get current directory")?;
     let cwd_str = cwd.to_str().ok_or_else(|| anyhow!("CWD not UTF-8"))?;
-
-    let (main_arg, run_contents) = match exec_mode {
-        ExecMode::Code(code_str) => (
-            vec!["".to_string()],
-            format!("exec({:?}, {{'__name__':'__main__'}})", code_str),
+    let env_vars: HashMap<String, String> = env::vars().collect();
+    let env_str = json::stringify(env_vars);
+    let (argv, snippet) = match run_mode {
+        RunMode::Code(snip) => (
+            vec!["-c".to_string()], // matches python, via `python -c "import sys; print(sys.argv)"`
+            format!("exec({:?}, {{**globals(), '__name__':'__main__'}})", snip),
         ),
-        ExecMode::Module(module_str) => {
-            let mut argv = vec![module_str.to_string()];
-            argv.extend(script_args.iter().cloned());
-            (
-                argv,
-                format!("runpy.run_module({:?}, run_name='__main__')", module_str),
-            )
+        RunMode::Module(module_str, mut script_args) => {
+            let snip = format!("import runpy; runpy.run_module({:?}, run_name='__main__', alter_sys=True)", &module_str);
+            script_args.insert(0, module_str);
+            ( script_args, snip)
         }
-        ExecMode::Script(script_path) => {
-            let mut argv = vec![script_path.to_string()];
-            argv.extend(script_args.iter().cloned());
-            let script_contents = fs::read_to_string(script_path)
-                .with_context(|| format!("Failed to read script '{}'", script_path))?;
-            (
-                argv,
-                format!("exec({:?}, {{'__name__':'__main__'}})", script_contents),
-            )
+        RunMode::Script(script_path, mut script_args) => {
+            let snip = format!("import runpy; runpy.run_path({:?}, run_name='__main__')", &script_path);
+            script_args.insert(0, script_path);
+            ( script_args, snip)
         }
+        RunMode::Repl => (
+            vec!["".to_string()],
+            "import code; code.interact(local={}, exitmsg='')".to_string(),
+        )
     };
+    let argv_str= json::stringify(argv);
 
-    let argv_python_list = {
-        let mut s = String::from("[");
-        for arg in &main_arg {
-            let a_esc = arg.replace("'", "\\'");
-            s.push_str(&format!("'{}', ", a_esc));
-        }
-        s.push(']');
-        s
-    };
-
-    let env_lines = generate_env_lines();
-
-    let setup_code = format!(
-        r#"
-import sys, os, runpy
+    let instructions = format!(
+        r#"import sys, os
 
 os.environ.clear()
-{env_lines}
-os.chdir('{cwd_str}')
-sys.argv = {argv_python_list}
-"#,
-        env_lines = env_lines,
-        cwd_str = cwd_str,
-        argv_python_list = argv_python_list
-    );
+os.environ.update({env_str})
+os.chdir({cwd_str:?})
+sys.argv.clear()
+sys.argv.extend({argv_str})
 
-    Ok(format!("{setup_code}\n{run_contents}"))
+{snippet}
+"#,
+    );
+    Ok(instructions)
 }
 
 pub fn main() -> Result<i32> {
-    let (prelude, config) = parse_args()?;
-
-    if let Some(prelude_script) = prelude {
-        initialize(&prelude_script)?;
-        return Ok(0);
+    let args = parse_args()?;
+    match args {
+        Args::Init(prelude_script) => {
+            initialize(&prelude_script)?;
+            Ok(0)
+        }
+        Args::Run(run_mode) => {
+            let instructions = generate_instructions(run_mode)?;
+            let interpreter = take_interpreter()?;
+            do_proxy(interpreter.pty_master_fd.as_fd(), &instructions)?;
+            let exit_code = get_exit_code(&interpreter)?;
+            Ok(exit_code)
+        }
     }
-
-    let final_code = generate_final_code(&config.exec_mode, &config.script_args)?;
-    eprintln!("{}", final_code);
-    process::exit(1);
-
-    let interpreter = take_interpreter()?;
-    do_proxy(interpreter.pty_master_fd.as_fd(), &final_code)?;
-
-    let exit_code = get_exit_code(&interpreter)?;
-    Ok(exit_code)
 }
