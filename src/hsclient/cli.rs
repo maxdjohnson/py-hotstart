@@ -61,7 +61,7 @@ fn parse_args() -> Result<Args> {
         .after_help("Usage: py-hotstart [options] [-c cmd | -m module | script.py] [args]")
         .get_matches();
 
-    if matches.get_one::<bool>("restart").is_some() {
+    if matches.get_one::<bool>("restart").copied().unwrap_or(false) {
         return Ok(Args::Restart);
     }
     let prelude = matches

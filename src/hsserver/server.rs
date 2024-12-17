@@ -1,9 +1,9 @@
 use crate::hsserver::daemon::{daemonize, PidFileGuard};
 use crate::hsserver::supervisor::{ChildId, Supervisor};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use anyhow::{bail, Context, Result};
 use nix::libc;
 use nix::pty::PtyMaster;
-use nix::sys::select::{select, FdSet};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use nix::unistd::{ForkResult, Pid};
 use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
@@ -49,6 +49,8 @@ impl ServerState {
 
         let listener =
             UnixListener::bind(SOCKET_PATH).context("Failed to bind Unix domain socket")?;
+
+        eprintln!("Listening on {}", SOCKET_PATH);
 
         let (sigchld_fd, sigterm_fd) = {
             let (sigchld_r, sigchld_w) = UnixStream::pair()?;
@@ -110,27 +112,26 @@ impl ServerState {
     }
 
     fn run_one(&mut self) -> Result<bool> {
-        // Wait for input or signal
-        let (listener_ready, sigchld_ready, sigterm_ready) = {
-            let listener_fd = self.listener.as_fd();
-            let sigchld_fd = self.sigchld_fd.as_fd();
-            let sigterm_fd = self.sigterm_fd.as_fd();
-            let mut readfds = FdSet::new();
-            readfds.insert(listener_fd);
-            readfds.insert(sigchld_fd);
-            readfds.insert(sigterm_fd);
+        let listener_fd = self.listener.as_fd();
+        let sigchld_fd = self.sigchld_fd.as_fd();
+        let sigterm_fd = self.sigterm_fd.as_fd();
 
-            let ready = select(None, &mut readfds, None, None, None)?;
-            if ready == 0 {
-                (false, false, false)
-            } else {
-                (
-                    readfds.contains(listener_fd),
-                    readfds.contains(sigchld_fd),
-                    readfds.contains(sigterm_fd),
-                )
-            }
-        };
+        let mut fds = [
+            PollFd::new(listener_fd, PollFlags::POLLIN),
+            PollFd::new(sigchld_fd, PollFlags::POLLIN),
+            PollFd::new(sigterm_fd, PollFlags::POLLIN),
+        ];
+
+        // Wait for input or signal
+        let ready = poll(&mut fds, PollTimeout::NONE)?;
+
+        if ready == 0 {
+            return Ok(true);
+        }
+
+        let listener_ready = fds[0].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let sigchld_ready = fds[1].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let sigterm_ready = fds[2].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
 
         if sigchld_ready {
             let mut buf = [0u8; 64];
