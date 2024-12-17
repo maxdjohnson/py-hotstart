@@ -155,6 +155,7 @@ fn proxy_loop(
         // Check PTY for output
         if let Some(revents) = pty_revents {
             if revents.contains(PollFlags::POLLIN) {
+                // TODO: handle eintr
                 let n = read(pty_fd.as_raw_fd(), &mut buf).unwrap_or(0);
                 if n == 0 {
                     // Interpreter exited

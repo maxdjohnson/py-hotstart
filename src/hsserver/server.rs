@@ -123,10 +123,13 @@ impl ServerState {
         ];
 
         // Wait for input or signal
-        let ready = poll(&mut fds, PollTimeout::NONE)?;
-
-        if ready == 0 {
-            return Ok(true);
+        loop {
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(0) => continue,
+                Ok(_) => break,
+                Err(nix::Error::EINTR) => continue,
+                Err(e) => bail!("poll failed: {}", e),
+            };
         }
 
         let listener_ready = fds[0].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
@@ -203,7 +206,7 @@ impl ServerState {
             let fds = [interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
             sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-                .context("Failed to sendmsg")?;
+                .context("Failed to sendmsg")?; // TODO: eintr
             // Purposefully keep the reference until _after_ it's successfully sent to cli
             self.current_interpreter = None;
 
