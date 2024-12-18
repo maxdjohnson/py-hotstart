@@ -5,12 +5,7 @@ import runpy  # noqa
 
 
 def __py_hotstart_loop__():
-    def log(msg):
-        with open("/tmp/py-hotstart.interpreter.log", "+a") as f:
-            f.write(f"{os.getpid()} {msg}\n")
-
     try:
-        log("starting supervision")
         with open(3) as ctrl:
             # While under supervision, evaluate expressions from control fd in a loop.
             state = {"__supervised__": True}
@@ -21,14 +16,16 @@ def __py_hotstart_loop__():
                 exec(eval(line), globals(), state)
 
             # Supervision done. Read the rest of ctrl for instructions.
-            log("finished supervision")
             line = ctrl.read().strip()
-        # parse from string with eval, and return it.
+
+        # Parse instructions from string with eval, and return it.
         return eval(line)
     except Exception:
+        import time
         import traceback
 
-        log(f"{traceback.format_exc()}")
+        with open("/tmp/py-hotstart.interpreter.log", "+a") as f:
+            f.write(f"{time.time()} {os.getpid()} {traceback.format_exc()}\n")
         os._exit(1)
 
 
