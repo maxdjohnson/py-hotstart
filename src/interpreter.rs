@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use nix::libc;
 use nix::unistd::Pid;
 use std::fmt;
@@ -91,21 +91,20 @@ impl Interpreter {
 
     pub fn unsupervise(&mut self) -> Result<()> {
         let stop_supervision = "supervised = False";
-        self.control_fd
-            .write_all(format!("{:?}\n", stop_supervision).as_ref())
-            .context("interpreter unsupervise send failed")?;
+        if let Err(err) = self.control_fd.write_all(format!("{:?}\n", stop_supervision).as_ref()) {
+            // This can happen if interpreter has died
+            eprintln!("interpreter unsupervise err writing to control_fd: {}", err);
+        }
         self.supervised = false;
         Ok(())
     }
 
     pub fn run_instructions(&mut self, instructions: &str) -> Result<()> {
         assert!(!self.supervised, "still supervised");
-        self.control_fd
-            .write_all(format!("{:?}\n", instructions).as_ref())
-            .context("interpreter run_instructions send failed")?;
-        self.control_fd
-            .shutdown(Shutdown::Both)
-            .context("shutdown function failed")?;
+        if let Err(err) = self.control_fd.write_all(format!("{:?}\n", instructions).as_ref()) {
+            eprintln!("interpreter run_instructions send failed: {}", err);
+        }
+        let _ = self.control_fd.shutdown(Shutdown::Both); // ignore error
         Ok(())
     }
 

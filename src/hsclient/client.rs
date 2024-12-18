@@ -43,10 +43,14 @@ pub fn initialize(prelude: &str) -> Result<()> {
 
 pub fn take_interpreter() -> Result<Interpreter> {
     let stream = send_request("TAKE")?;
-    let mut bytes = [0u8; 32]; // Assume max msg len of 32
+    let mut bytes = [0u8; 1024];
     let mut fds = [0; 2];
     let (n_bytes, n_fds) = stream.recv_with_fd(&mut bytes, &mut fds)?;
-    unsafe { Interpreter::from_raw(&bytes[..n_bytes], &fds[..n_fds]) }
+    let msg = &bytes[..n_bytes];
+    if n_fds != 2 {
+        bail!("error: {}", String::from_utf8_lossy(msg));
+    }
+    unsafe { Interpreter::from_raw(msg, &fds[..n_fds]) }
 }
 
 pub fn get_exit_code(id: &ChildId) -> Result<i32> {

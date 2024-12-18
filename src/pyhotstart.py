@@ -9,10 +9,10 @@ def __py_hotstart_loop__():
     with socket.socket(family=socket.AF_UNIX, fileno=3) as sock, sock.makefile() as ctrl:
         try:
             # While under supervision, evaluate expressions from control fd in a loop.
-            supervised = True
-            while supervised:
+            local = {"supervised": True}
+            while local["supervised"]:
                 line = ctrl.readline().strip()
-                exec(eval(line))
+                exec(eval(line), globals(), local)
 
             # Supervision done. Read the rest of ctrl for instructions.
             line = ctrl.read().strip()

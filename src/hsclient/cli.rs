@@ -172,11 +172,10 @@ pub fn main() -> Result<i32> {
             Ok(0)
         }
         Args::Run(run_mode) => {
+            let mut interpreter = take_interpreter()?;
+
             let terminal_mode = TerminalModeGuard::new(std::io::stdin().as_fd())?;
             let instructions = generate_instructions(&terminal_mode, run_mode)?;
-
-            // Take an interpreter and run the instructions
-            let mut interpreter = take_interpreter()?;
             interpreter.run_instructions(&instructions)?;
 
             // Proxy the interpreter's pty until it's done, then return exit code
