@@ -29,6 +29,7 @@ const PY_STOP_SUPERVISION: &str = "__py_hotstart_supervised__ == False";
 
 struct InterpreterState {
     id: ChildId,
+    control_fd: UnixStream,
     pty_master_fd: PtyMaster,
 }
 
@@ -84,12 +85,13 @@ impl ServerState {
 
     fn ensure_interpreter(&mut self) -> Result<()> {
         if self.current_interpreter.is_none() {
-            let (id, fd) = self
+            let (id, control_fd, pty_master_fd) = self
                 .supervisor
                 .spawn_interpreter(self.prelude_code.as_deref())?;
             self.current_interpreter = Some(InterpreterState {
                 id,
-                pty_master_fd: fd,
+                control_fd,
+                pty_master_fd,
             });
         }
         Ok(())
@@ -201,11 +203,11 @@ impl ServerState {
                 .current_interpreter
                 .as_mut()
                 .context("no interpreter")?;
-            writeln!(interp.pty_master_fd, "{}", PY_STOP_SUPERVISION.trim())
+            writeln!(interp.control_fd, "{}", PY_STOP_SUPERVISION.trim())
                 .context("Failed to write to interpreter tty")?;
             let response = format!("OK {}", interp.id);
             let iov = [IoSlice::new(response.as_bytes())];
-            let fds = [interp.pty_master_fd.as_raw_fd()];
+            let fds = [interp.control_fd.as_raw_fd(), interp.pty_master_fd.as_raw_fd()];
             let cmsg = [ControlMessage::ScmRights(&fds)];
             eprintln!("Responding: {:?}", response);
             sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)

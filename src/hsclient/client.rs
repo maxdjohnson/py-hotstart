@@ -10,6 +10,7 @@ use std::os::unix::net::UnixStream;
 
 pub struct ClientInterpreter {
     pub id: String,
+    pub control_fd: OwnedFd,
     pub pty_master_fd: OwnedFd,
 }
 
@@ -53,9 +54,9 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
     let stream = send_request("TAKE")?;
     let mut buf = [0u8; 32];
     let mut iov = [IoSliceMut::new(&mut buf)];
-    let mut cmsgspace = cmsg_space!([RawFd; 1]);
+    let mut cmsgspace = cmsg_space!([RawFd; 2]);
 
-    let (n, pty_fd) = {
+    let (n, control_fd, pty_fd) = {
         let msg = recvmsg::<()>(
             stream.as_raw_fd(),
             &mut iov,
@@ -66,14 +67,16 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
         if msg.bytes == 0 {
             bail!("No message in response");
         }
+        let mut control_fd: Option<OwnedFd> = None;
         let mut pty_fd: Option<OwnedFd> = None;
         for cmsg in msg.cmsgs()? {
             if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                pty_fd = fds.first().map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) });
-                break;
+                let mut owned_fds: Vec<OwnedFd> = fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+                control_fd = Some(owned_fds.remove(0));
+                pty_fd = Some(owned_fds.remove(0));
             }
         }
-        (msg.bytes, pty_fd.context("No fd in response")?)
+        (msg.bytes, control_fd.context("No control_fd in response")?, pty_fd.context("No pty_fd in response")?)
     };
 
     let resp_str = String::from_utf8_lossy(&iov[0][..n]);
@@ -82,12 +85,13 @@ pub fn take_interpreter() -> Result<ClientInterpreter> {
         .with_context(|| format!("invalid response {}", resp_str))?;
     Ok(ClientInterpreter {
         id: id.to_string(),
+        control_fd,
         pty_master_fd: pty_fd,
     })
 }
 
-pub fn get_exit_code(interpreter: &ClientInterpreter) -> Result<i32> {
-    let req = format!("EXITCODE {}", interpreter.id);
+pub fn get_exit_code(id: &str) -> Result<i32> {
+    let req = format!("EXITCODE {}", id);
     let mut stream = send_request(&req)?;
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;

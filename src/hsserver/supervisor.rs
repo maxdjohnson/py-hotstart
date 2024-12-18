@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{open, OFlag};
+use std::os::unix::net::UnixStream;
 use nix::sys::termios::{tcgetattr, tcsetattr, cfmakeraw, SetArg};
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
@@ -10,7 +11,7 @@ use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResu
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -88,13 +89,14 @@ impl Supervisor {
     pub fn spawn_interpreter(
         &mut self,
         prelude_code: Option<&str>,
-    ) -> Result<(ChildId, PtyMaster)> {
+    ) -> Result<(ChildId, UnixStream, PtyMaster)> {
         let interpreter = Interpreter::spawn(prelude_code)?;
         let child_id = self.next_child_id;
         self.next_child_id += 1;
         self.running_children.insert(interpreter.pid, child_id);
         Ok((
             ChildId::new(child_id, interpreter.pid),
+            interpreter.control_fd,
             interpreter.pty_master_fd,
         ))
     }
@@ -232,11 +234,13 @@ impl ExitInfoRecord {
 
 struct Interpreter {
     pid: Pid,
+    control_fd: UnixStream,
     pty_master_fd: PtyMaster,
 }
 
 impl Interpreter {
     fn spawn(prelude_code: Option<&str>) -> Result<Self> {
+        // Set up dedicated PTY for interpreter's stdio
         let master_fd =
             posix_openpt(OFlag::O_RDWR | OFlag::O_CLOEXEC).context("Failed to open PTY master")?;
         grantpt(&master_fd).context("Failed to grant PTY")?;
@@ -245,9 +249,14 @@ impl Interpreter {
         let slave_name = unsafe { ptsname(&master_fd) }.context("Failed to get PTY slave name")?;
         let slave_path: &str = slave_name.as_ref();
 
+        // Create a separate stream for sending instructions to the running interpreter.
+        let (control_r, control_w) = UnixStream::pair().context("Failed to create socket pair")?;
+        debug_assert!(control_r.as_raw_fd() > 3, "control_r fd is too low");
+
         match unsafe { fork() }.context("fork failed")? {
             ForkResult::Parent { child } => Ok(Interpreter {
                 pid: child,
+                control_fd: control_w,
                 pty_master_fd: master_fd,
             }),
             ForkResult::Child => {
@@ -278,6 +287,9 @@ impl Interpreter {
                         close(slave_fd).expect("failed to close pty slave fd");
                     }
                 }
+
+                // Dup control_r fd to 3 so that it survives exec and can be used by interpreter
+                dup2(control_r.as_raw_fd(), 3).expect("dup2 stderr failed");
 
                 // TIOCSCTTY to acquire controlling terminal
                 unsafe { ioctl_set_ctty(0, 0) }.expect("ioctl(TIOCSCTTY) failed");

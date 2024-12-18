@@ -74,7 +74,7 @@ fn sync_winsize(from_fd: BorrowedFd, to_fd: BorrowedFd) -> Result<()> {
 }
 
 /// Write all bytes from `buf` to `fd` until exhausted or error.
-fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
+pub fn write_all<Fd: AsFd>(fd: Fd, mut buf: &[u8]) -> Result<(), nix::Error> {
     while !buf.is_empty() {
         match write(fd.as_fd(), buf) {
             Ok(0) => return Err(nix::Error::from(Errno::EIO)),
@@ -189,7 +189,7 @@ fn proxy_loop(
 }
 
 /// Entrypoint for setting up and running the terminal proxy. Expects terminal in raw mode.
-pub fn do_proxy(pty_fd: BorrowedFd, instructions: &str) -> Result<()> {
+pub fn do_proxy(_guard: &TerminalModeGuard, pty_fd: BorrowedFd) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stdin_fd = stdin.as_fd();
@@ -202,11 +202,6 @@ pub fn do_proxy(pty_fd: BorrowedFd, instructions: &str) -> Result<()> {
     if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
         eprintln!("Failed to sync window size: {}", e);
     }
-
-    // Write instructions to interpreter
-    let instructions_literal = format!("{:?}\n", instructions);
-    write_all(pty_fd, instructions_literal.as_bytes())
-        .context("Failed to write instructions to interpreter")?;
 
     // Run the polling loop
     proxy_loop(pty_fd, stdin_fd, stdout_fd, sigwinch_r)?;
