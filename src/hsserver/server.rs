@@ -177,7 +177,7 @@ impl ServerState {
             self.prelude_code = Some(prelude.to_string());
 
             // Kill current interpreter (if present)
-            if let Some(interp) = &self.current_interpreter {
+            if let Some(interp) = &self.current_interpreter.take() {
                 self.supervisor.kill(interp.id())?;
             }
 

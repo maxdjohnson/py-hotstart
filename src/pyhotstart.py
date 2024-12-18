@@ -2,6 +2,11 @@ import os
 import runpy  # noqa
 import socket
 
+# Control socket fd is originally inheritable to survive `exec python`. Set it to False now that
+# python is running to avoid leaking it to child processes.
+os.set_inheritable(3, False)
+
+
 # prelude
 
 
@@ -27,7 +32,4 @@ def __py_hotstart_loop__():
             os._exit(1)
 
 
-# Control socket fd is originally inheritable to survive `exec python`. Set it to False now that
-# python is running to avoid leaking it to child processes.
-os.set_inheritable(3, False)
 exec(__py_hotstart_loop__(), {k: v for k, v in globals().items() if k != "__py_hotstart_loop__"})

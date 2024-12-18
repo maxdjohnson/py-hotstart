@@ -58,6 +58,7 @@ impl Supervisor {
     }
 
     pub fn kill(&mut self, child_id: &ChildId) -> Result<i32> {
+        eprintln!("kill {}", child_id);
         if self.running_children.contains_key(&child_id.pid) {
             // Send SIGTERM to request graceful termination
             let _ = nix::sys::signal::kill(child_id.pid, nix::sys::signal::SIGTERM);
@@ -175,6 +176,12 @@ impl ExitInfoRecord {
 }
 
 fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
+    // Write script
+    let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
+    std::fs::write(SCRIPT_PATH, script_with_prelude)
+        .context("Failed to write to temp file")?;
+    eprintln!("Starting interpreter prelude={:?} path={}", prelude_code, SCRIPT_PATH);
+
     // Set up dedicated PTY for interpreter's stdio
     let master_fd =
         posix_openpt(OFlag::O_RDWR | OFlag::O_CLOEXEC).context("Failed to open PTY master")?;
@@ -229,9 +236,6 @@ fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
             tcsetpgrp(std::io::stdin(), pid).expect("tcsetpgrp failed");
 
             // Prepare python command
-            let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
-            std::fs::write(SCRIPT_PATH, script_with_prelude)
-                .context("Failed to write to temp file")?;
             let python = CString::new("python3").unwrap();
             let args = [python.clone(), CString::new(SCRIPT_PATH).unwrap()];
             execvp(&python, &args).expect("execvp failed");
