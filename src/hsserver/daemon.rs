@@ -1,10 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
-use nix::sys::signal::Signal;
-use std::time::{Duration, Instant};
 use nix::fcntl::{open, OFlag};
 use nix::libc;
 use nix::sys::signal::kill;
+use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
 use nix::unistd::Pid;
 use nix::unistd::{close, dup2, fork, setsid, ForkResult};
@@ -14,6 +13,7 @@ use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, Instant};
 
 const LOGFILE: &str = "/tmp/py-hotstart.log";
 

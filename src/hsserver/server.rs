@@ -1,28 +1,23 @@
 use crate::hsserver::daemon::{daemonize, PidFileGuard};
 use crate::hsserver::supervisor::Supervisor;
+use crate::interpreter::{ChildId, Interpreter};
 use crate::sendfd::SendWithFd;
-use std::str::FromStr;
-use crate::interpreter::{Interpreter, ChildId};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use anyhow::{bail, Context, Result};
-use nix::libc;
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{ForkResult, Pid};
 use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
 use signal_hook::low_level::pipe;
 use std::fs;
-use std::io::{IoSlice, Read, Write};
-use std::os::fd::{AsFd};
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::str::FromStr;
 use std::time::Duration;
 
 use super::daemon::kill_with_timeout;
-
-// For TIOCSCTTY
-nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 pub const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 const PIDFILE_PATH: &str = "/tmp/py_hotstart.pid";
@@ -79,9 +74,10 @@ impl ServerState {
 
     fn ensure_interpreter(&mut self) -> Result<()> {
         if self.current_interpreter.is_none() {
-            self.current_interpreter = Some( self
-                .supervisor
-                .spawn_interpreter(self.prelude_code.as_deref())?);
+            self.current_interpreter = Some(
+                self.supervisor
+                    .spawn_interpreter(self.prelude_code.as_deref())?,
+            );
         }
         Ok(())
     }
@@ -123,9 +119,15 @@ impl ServerState {
             };
         }
 
-        let listener_ready = fds[0].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
-        let sigchld_ready = fds[1].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
-        let sigterm_ready = fds[2].revents().map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let listener_ready = fds[0]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let sigchld_ready = fds[1]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let sigterm_ready = fds[2]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
 
         if sigchld_ready {
             let mut buf = [0u8; 64];
@@ -194,7 +196,9 @@ impl ServerState {
                 .context("no interpreter")?;
             interp.unsupervise()?;
             let (msg, fds) = interp.to_raw();
-            stream.send_with_fd(&msg, &fds).context("take send_with_fds failed")?;
+            stream
+                .send_with_fd(&msg, &fds)
+                .context("take send_with_fds failed")?;
             // Purposefully keep the reference until _after_ it's successfully sent to cli
             self.current_interpreter = None;
 

@@ -1,7 +1,7 @@
 mod hsclient;
+mod hsserver;
 mod interpreter;
 mod sendfd;
-mod hsserver;
 
 fn main() {
     match hsclient::cli::main() {

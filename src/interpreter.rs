@@ -1,25 +1,14 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use nix::libc;
+use nix::unistd::Pid;
+use std::fmt;
+use std::fs::File;
+use std::io::Write;
 use std::net::Shutdown;
-use std::io::{BufRead, Write};
-use nix::fcntl::{open, OFlag};
-use std::io::BufReader;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use nix::libc;
-use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
-use nix::sys::stat::Mode;
-use std::fd::File;
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
-use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResult};
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fmt;
-use std::os::fd::{AsRawFd, RawFd};
 use std::str::FromStr;
-use std::time::{Duration, Instant};
-
-const PY_STOP_SUPERVISION: &str = "supervised = False; ctrl.write('OK\\n')";
 
 // Pair of child_id and Pid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,8 +44,12 @@ impl FromStr for ChildId {
             .and_then(|s| s.split_once(','))
             .ok_or_else(|| ParseChildIdError(s.to_string()))?;
 
-        let id = x.parse::<u32>().map_err(|_| ParseChildIdError(s.to_string()))?;
-        let pid = y.parse::<libc::pid_t>().map_err(|_| ParseChildIdError(s.to_string()))?;
+        let id = x
+            .parse::<u32>()
+            .map_err(|_| ParseChildIdError(s.to_string()))?;
+        let pid = y
+            .parse::<libc::pid_t>()
+            .map_err(|_| ParseChildIdError(s.to_string()))?;
 
         Ok(ChildId {
             id,
@@ -71,19 +64,21 @@ impl ChildId {
     }
 }
 
-
 pub struct Interpreter {
     id: ChildId,
     control_fd: UnixStream,
     pty_master_fd: File,
     supervised: bool,
-    control_reader: BufReader<UnixStream>,
 }
-
 
 impl Interpreter {
     pub fn new(id: ChildId, control_fd: UnixStream, pty_master_fd: File) -> Self {
-        Interpreter { id, control_fd, pty_master_fd, supervised: true, control_reader: BufReader::new(control_fd) }
+        Interpreter {
+            id,
+            control_fd,
+            pty_master_fd,
+            supervised: true,
+        }
     }
 
     pub fn id(&self) -> &ChildId {
@@ -95,20 +90,22 @@ impl Interpreter {
     }
 
     pub fn unsupervise(&mut self) -> Result<()> {
-        self.control_fd.write_all(format!("{:?}\n", PY_STOP_SUPERVISION.trim()).as_ref()).context("interpreter unsupervise send failed")?;
-        let mut response_buf = String::new();
-        self.control_reader.read_line(&mut response_buf).context("interpreter unsupervise read_line failed")?;
-        if response_buf.trim() != "OK" {
-            bail!("interpreter unsupervise error: {}", response_buf.trim())
-        }
+        let stop_supervision = "supervised = False";
+        self.control_fd
+            .write_all(format!("{:?}\n", stop_supervision).as_ref())
+            .context("interpreter unsupervise send failed")?;
         self.supervised = false;
         Ok(())
     }
 
     pub fn run_instructions(&mut self, instructions: &str) -> Result<()> {
         assert!(!self.supervised, "still supervised");
-        self.control_fd.write_all(format!("{:?}\n", instructions).as_ref()).context("interpreter run_instructions send failed")?;
-        self.control_fd.shutdown(Shutdown::Both).context("shutdown function failed")?;
+        self.control_fd
+            .write_all(format!("{:?}\n", instructions).as_ref())
+            .context("interpreter run_instructions send failed")?;
+        self.control_fd
+            .shutdown(Shutdown::Both)
+            .context("shutdown function failed")?;
         Ok(())
     }
 
@@ -119,7 +116,6 @@ impl Interpreter {
             control_fd,
             pty_master_fd: OwnedFd::from_raw_fd(fds[1]).into(),
             supervised: false,
-            control_reader: BufReader::new(control_fd),
         })
     }
 
@@ -153,7 +149,11 @@ mod tests {
         let inputs = ["123,456", "(123,456", "123,456)", ""];
 
         for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+            assert!(
+                ChildId::from_str(input).is_err(),
+                "Should fail for input: {}",
+                input
+            );
         }
     }
 
@@ -162,7 +162,11 @@ mod tests {
         let inputs = ["(123 456)", "(123)", "(,456)", "(123,)"];
 
         for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+            assert!(
+                ChildId::from_str(input).is_err(),
+                "Should fail for input: {}",
+                input
+            );
         }
     }
 
@@ -171,7 +175,11 @@ mod tests {
         let inputs = ["(abc,456)", "(123,xyz)", "(abc,xyz)"];
 
         for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+            assert!(
+                ChildId::from_str(input).is_err(),
+                "Should fail for input: {}",
+                input
+            );
         }
     }
 }

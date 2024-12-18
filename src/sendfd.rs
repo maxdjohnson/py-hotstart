@@ -1,10 +1,9 @@
-use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-use std::mem;
 use nix::libc;
+use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 use nix::sys::socket::{sendmsg, ControlMessage};
 use std::io;
-use std::os::unix::net;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net;
 
 /// An extension trait that enables sending associated file descriptors along with the data.
 pub trait SendWithFd {
@@ -22,25 +21,19 @@ pub trait RecvWithFd {
 
 fn send_with_fd(socket: RawFd, bs: &[u8], fds: &[RawFd]) -> nix::Result<usize> {
     let iov = [io::IoSlice::new(bs)];
-    let cmsg = [ControlMessage::ScmRights(&fds)];
+    let cmsg = [ControlMessage::ScmRights(fds)];
     sendmsg::<()>(socket, &iov, &cmsg, MsgFlags::empty(), None)
 }
-
 
 fn recv_with_fd(socket: RawFd, bs: &mut [u8], fds: &mut [RawFd]) -> nix::Result<(usize, usize)> {
     let mut iov = [io::IoSliceMut::new(bs)];
 
-    // construct cmsgspace manually based on fds.len(), not supported by nix::cmsg_space!
-    let fds_len = mem::size_of::<RawFd>() * fds.len();
+    // construct cmsgspace manually based on size of fds, not supported by nix::cmsg_space!
+    let fds_len = std::mem::size_of_val(fds);
     let cmsg_buffer_len = unsafe { libc::CMSG_SPACE(fds_len as u32) as usize };
     let mut cmsgspace = Vec::<u8>::with_capacity(cmsg_buffer_len);
 
-    let msg = recvmsg::<()>(
-        socket,
-        &mut iov,
-        Some(&mut cmsgspace),
-        MsgFlags::empty(),
-    )?;
+    let msg = recvmsg::<()>(socket, &mut iov, Some(&mut cmsgspace), MsgFlags::empty())?;
     let mut descriptor_count = 0;
     for cmsg in msg.cmsgs()? {
         if let ControlMessageOwned::ScmRights(cmsg_fds) = cmsg {
@@ -121,10 +114,10 @@ mod tests {
     fn sending_junk_fails() {
         let (l, _) = net::UnixStream::pair().expect("create UnixStream pair");
         let sent_bytes = b"hello world!";
-        if let Ok(_) = l.send_with_fd(&sent_bytes[..], &[i32::max_value()][..]) {
+        if l.send_with_fd(&sent_bytes[..], &[i32::MAX][..]).is_ok() {
             panic!("expected an error when sending a junk file descriptor");
         }
-        if let Ok(_) = l.send_with_fd(&sent_bytes[..], &[0xffi32][..]) {
+        if l.send_with_fd(&sent_bytes[..], &[0xffi32][..]).is_ok() {
             panic!("expected an error when sending a junk file descriptor");
         }
     }

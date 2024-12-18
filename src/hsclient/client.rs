@@ -1,9 +1,9 @@
 use crate::hsserver::server::{ensure, SOCKET_PATH};
+use crate::interpreter::{ChildId, Interpreter};
+use crate::sendfd::RecvWithFd;
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use crate::interpreter::{Interpreter, ChildId};
-use crate::sendfd::RecvWithFd;
 
 pub fn ensure_server() -> Result<()> {
     ensure()?;
@@ -46,7 +46,7 @@ pub fn take_interpreter() -> Result<Interpreter> {
     let mut bytes = [0u8; 32]; // Assume max msg len of 32
     let mut fds = [0; 2];
     let (n_bytes, n_fds) = stream.recv_with_fd(&mut bytes, &mut fds)?;
-    Ok(unsafe {Interpreter::from_raw(&bytes[..n_bytes], &fds[..n_fds])}?)
+    unsafe { Interpreter::from_raw(&bytes[..n_bytes], &fds[..n_fds]) }
 }
 
 pub fn get_exit_code(id: &ChildId) -> Result<i32> {
@@ -55,8 +55,10 @@ pub fn get_exit_code(id: &ChildId) -> Result<i32> {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf)?;
     let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-    let exit_code = resp.strip_prefix("OK ")
+    let exit_code = resp
+        .strip_prefix("OK ")
         .with_context(|| format!("unexpected exit code response {}", resp))?;
-    exit_code.parse::<i32>()
+    exit_code
+        .parse::<i32>()
         .context("Failed to parse exit code from server")
 }

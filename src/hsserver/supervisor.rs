@@ -1,7 +1,6 @@
+use crate::interpreter::{ChildId, Interpreter};
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{open, OFlag};
-use std::os::unix::net::UnixStream;
-use std::fs::File;
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt};
 use nix::sys::stat::Mode;
@@ -10,9 +9,10 @@ use nix::unistd::Pid;
 use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResult};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, IntoRawFd, FromRawFd};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
-use crate::interpreter::{ChildId, Interpreter};
 
 const SCRIPT: &str = include_str!("../pyhotstart.py");
 const SCRIPT_PATH: &str = "/tmp/pyhotstart.py";
@@ -35,10 +35,7 @@ impl Supervisor {
         }
     }
 
-    pub fn spawn_interpreter(
-        &mut self,
-        prelude_code: Option<&str>,
-    ) -> Result<Interpreter> {
+    pub fn spawn_interpreter(&mut self, prelude_code: Option<&str>) -> Result<Interpreter> {
         let interpreter = spawn(self.next_child_id, prelude_code)?;
         let child_id = self.next_child_id;
         self.next_child_id += 1;
@@ -188,7 +185,8 @@ fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
     let slave_path: &str = slave_name.as_ref();
 
     // Create a separate stream for sending instructions to the running interpreter.
-    let (control_r, control_w) = UnixStream::pair().context("Failed to create control socket pair")?;
+    let (control_r, control_w) =
+        UnixStream::pair().context("Failed to create control socket pair")?;
     debug_assert!(control_r.as_raw_fd() > 3, "control_r fd is too low");
 
     match unsafe { fork() }.context("fork failed")? {

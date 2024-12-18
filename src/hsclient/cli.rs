@@ -1,15 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use std::net::Shutdown;
 use clap::{Arg, ArgAction, Command};
 use std::collections::HashMap;
-use std::io::Write;
-use std::os::fd::AsFd;
 use std::env;
+use std::os::fd::AsFd;
 
-use crate::hsclient::client::{get_exit_code, initialize, take_interpreter, ensure_server};
+use crate::hsclient::client::{ensure_server, get_exit_code, initialize, take_interpreter};
 use crate::hsclient::proxy::do_proxy;
 use crate::hsserver::server::restart;
-use crate::interpreter::Interpreter;
 
 use super::proxy::TerminalModeGuard;
 
@@ -135,7 +132,8 @@ fn generate_instructions(terminal_mode: &TerminalModeGuard, run_mode: RunMode) -
     let argv_str = json::stringify(argv);
 
     let mode = terminal_mode.get_original();
-    let cc_elems = &mode.control_chars
+    let cc_elems = &mode
+        .control_chars
         .iter()
         .map(|b| format!("b'\\x{:02x}'", b))
         .collect::<Vec<_>>()
@@ -178,11 +176,11 @@ pub fn main() -> Result<i32> {
             let instructions = generate_instructions(&terminal_mode, run_mode)?;
 
             // Take an interpreter and run the instructions
-            let interpreter = take_interpreter()?;
-            interpreter.run_instructions(&instructions);
+            let mut interpreter = take_interpreter()?;
+            interpreter.run_instructions(&instructions)?;
 
             // Proxy the interpreter's pty until it's done, then return exit code
-            do_proxy(&terminal_mode, interpreter.pty_master_fd())?;
+            do_proxy(&terminal_mode, interpreter.pty_master_fd().as_fd())?;
             let exit_code = get_exit_code(interpreter.id())?;
             Ok(exit_code)
         }
