@@ -18,7 +18,6 @@ def __py_hotstart_loop__():
                 # 'line' is a Python string literal like: "try:\n    foo()\n..."
                 # Convert it from a literal representation to the actual string, then run it.
                 line = ctrl.readline().strip()
-                log(f"running line {line}")
                 exec(eval(line), globals(), state)
 
             # Supervision done. Read the rest of ctrl for instructions.
@@ -29,7 +28,7 @@ def __py_hotstart_loop__():
     except Exception:
         import traceback
 
-        log(f"error {traceback.format_exc()}")
+        log(f"{traceback.format_exc()}")
         os._exit(1)
 
 
