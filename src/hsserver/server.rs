@@ -1,5 +1,6 @@
 use crate::hsserver::daemon::{daemonize, PidFileGuard};
 use crate::hsserver::supervisor::Supervisor;
+use crate::sendfd::SendWithFd;
 use std::str::FromStr;
 use crate::interpreter::{Interpreter, ChildId};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -11,7 +12,7 @@ use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
 use signal_hook::low_level::pipe;
 use std::fs;
 use std::io::{IoSlice, Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -25,7 +26,6 @@ nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 pub const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 const PIDFILE_PATH: &str = "/tmp/py_hotstart.pid";
-const PY_STOP_SUPERVISION: &str = "supervised = False; ctrl.write('OK\\n')";
 
 struct ServerState {
     listener: UnixListener,
@@ -176,7 +176,7 @@ impl ServerState {
 
             // Kill current interpreter (if present)
             if let Some(interp) = &self.current_interpreter {
-                self.supervisor.kill(interp.id)?;
+                self.supervisor.kill(interp.id())?;
             }
 
             // Start new interpreter
@@ -192,18 +192,9 @@ impl ServerState {
                 .current_interpreter
                 .as_mut()
                 .context("no interpreter")?;
-            writeln!(interp.control_fd, "{:?}", PY_STOP_SUPERVISION.trim())
-                .context("Failed to write to interpreter tty")?;
-            let mut response_buf = String::new();
-            interp.control_fd.read_line(&mut response_buf).context("Failed to read from interpreter control fd")?;
-            eprintln!("Received from interpreter: {:?}", response_buf.trim());
-            let response = format!("OK {}", interp.id);
-            let iov = [IoSlice::new(response.as_bytes())];
-            let fds = [interp.control_fd.as_raw_fd(), interp.pty_master_fd.as_raw_fd()];
-            let cmsg = [ControlMessage::ScmRights(&fds)];
-            eprintln!("Responding: {:?}", response);
-            sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-                .context("Failed to sendmsg")?; // TODO: eintr
+            interp.unsupervise()?;
+            let (msg, fds) = interp.to_raw();
+            stream.send_with_fd(&msg, &fds).context("take send_with_fds failed")?;
             // Purposefully keep the reference until _after_ it's successfully sent to cli
             self.current_interpreter = None;
 

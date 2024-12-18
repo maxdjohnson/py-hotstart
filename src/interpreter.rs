@@ -1,11 +1,14 @@
 use anyhow::{bail, Context, Result};
+use std::net::Shutdown;
+use std::io::{BufRead, Write};
 use nix::fcntl::{open, OFlag};
+use std::io::BufReader;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::sys::stat::Mode;
-use std::fs::File;
+use std::fd::File;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResult};
@@ -15,6 +18,8 @@ use std::fmt;
 use std::os::fd::{AsRawFd, RawFd};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+const PY_STOP_SUPERVISION: &str = "supervised = False; ctrl.write('OK\\n')";
 
 // Pair of child_id and Pid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,22 +73,58 @@ impl ChildId {
 
 
 pub struct Interpreter {
-    pub id: ChildId,
-    pub control_fd: UnixStream,
-    pub pty_master_fd: File,
+    id: ChildId,
+    control_fd: UnixStream,
+    pty_master_fd: File,
+    supervised: bool,
+    control_reader: BufReader<UnixStream>,
 }
 
 
 impl Interpreter {
+    pub fn new(id: ChildId, control_fd: UnixStream, pty_master_fd: File) -> Self {
+        Interpreter { id, control_fd, pty_master_fd, supervised: true, control_reader: BufReader::new(control_fd) }
+    }
+
+    pub fn id(&self) -> &ChildId {
+        &self.id
+    }
+
+    pub fn pty_master_fd(&self) -> &File {
+        &self.pty_master_fd
+    }
+
+    pub fn unsupervise(&mut self) -> Result<()> {
+        self.control_fd.write_all(format!("{:?}\n", PY_STOP_SUPERVISION.trim()).as_ref()).context("interpreter unsupervise send failed")?;
+        let mut response_buf = String::new();
+        self.control_reader.read_line(&mut response_buf).context("interpreter unsupervise read_line failed")?;
+        if response_buf.trim() != "OK" {
+            bail!("interpreter unsupervise error: {}", response_buf.trim())
+        }
+        self.supervised = false;
+        Ok(())
+    }
+
+    pub fn run_instructions(&mut self, instructions: &str) -> Result<()> {
+        assert!(!self.supervised, "still supervised");
+        self.control_fd.write_all(format!("{:?}\n", instructions).as_ref()).context("interpreter run_instructions send failed")?;
+        self.control_fd.shutdown(Shutdown::Both).context("shutdown function failed")?;
+        Ok(())
+    }
+
     pub unsafe fn from_raw(msg: &[u8], fds: &[RawFd]) -> Result<Self> {
+        let control_fd = UnixStream::from_raw_fd(fds[0]);
         Ok(Interpreter {
             id: ChildId::from_str(&String::from_utf8_lossy(msg))?,
-            control_fd: UnixStream::from_raw_fd(fds[0]),
+            control_fd,
             pty_master_fd: OwnedFd::from_raw_fd(fds[1]).into(),
+            supervised: false,
+            control_reader: BufReader::new(control_fd),
         })
     }
 
-    pub fn into_raw(self) -> (Vec<u8>, Vec<RawFd>) {
+    pub fn to_raw(&self) -> (Vec<u8>, Vec<RawFd>) {
+        assert!(!self.supervised, "cannot send supervised interpreter");
         let msg = self.id.to_string().into_bytes();
         let fds = vec![self.control_fd.as_raw_fd(), self.pty_master_fd.as_raw_fd()];
         (msg, fds)

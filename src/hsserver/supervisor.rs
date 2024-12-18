@@ -42,7 +42,7 @@ impl Supervisor {
         let interpreter = spawn(self.next_child_id, prelude_code)?;
         let child_id = self.next_child_id;
         self.next_child_id += 1;
-        self.running_children.insert(interpreter.id.pid, child_id);
+        self.running_children.insert(interpreter.id().pid, child_id);
         Ok(interpreter)
     }
 
@@ -60,7 +60,7 @@ impl Supervisor {
         bail!("could not get exit code for child {}", child_id);
     }
 
-    pub fn kill(&mut self, child_id: ChildId) -> Result<i32> {
+    pub fn kill(&mut self, child_id: &ChildId) -> Result<i32> {
         if self.running_children.contains_key(&child_id.pid) {
             // Send SIGTERM to request graceful termination
             let _ = nix::sys::signal::kill(child_id.pid, nix::sys::signal::SIGTERM);
@@ -128,7 +128,7 @@ impl Drop for Supervisor {
             .map(|(pid, id)| ChildId::new(*id, *pid))
             .collect();
         for id in child_ids {
-            if let Err(e) = self.kill(id) {
+            if let Err(e) = self.kill(&id) {
                 eprintln!("Failed to kill child process {}: {}", id, e);
             }
         }
@@ -192,11 +192,11 @@ fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
     debug_assert!(control_r.as_raw_fd() > 3, "control_r fd is too low");
 
     match unsafe { fork() }.context("fork failed")? {
-        ForkResult::Parent { child } => Ok(Interpreter {
-            id: ChildId::new(id, child),
-            control_fd: control_w,
-            pty_master_fd: unsafe { File::from_raw_fd(master_fd.into_raw_fd()) },
-        }),
+        ForkResult::Parent { child } => Ok(Interpreter::new(
+            ChildId::new(id, child),
+            control_w,
+            unsafe { File::from_raw_fd(master_fd.into_raw_fd()) },
+        )),
         ForkResult::Child => {
             // Child: setsid, set controlling TTY
             setsid().expect("setsid failed");

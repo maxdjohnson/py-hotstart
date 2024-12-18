@@ -176,17 +176,14 @@ pub fn main() -> Result<i32> {
         Args::Run(run_mode) => {
             let terminal_mode = TerminalModeGuard::new(std::io::stdin().as_fd())?;
             let instructions = generate_instructions(&terminal_mode, run_mode)?;
-            let Interpreter { id, mut control_fd, pty_master_fd } = take_interpreter()?;
 
-            // Write instructions to interpreter and close the control fd to start it
-            let instructions_literal = format!("{:?}\n", instructions);
-            control_fd.write_all(instructions_literal.as_bytes()).context("Failed to write instructions to interpreter")?;
-            control_fd.shutdown(Shutdown::Both).context("shutdown function failed")?;
-            drop(control_fd);
+            // Take an interpreter and run the instructions
+            let interpreter = take_interpreter()?;
+            interpreter.run_instructions(&instructions);
 
             // Proxy the interpreter's pty until it's done, then return exit code
-            do_proxy(&terminal_mode, pty_master_fd.as_fd())?;
-            let exit_code = get_exit_code(&id)?;
+            do_proxy(&terminal_mode, interpreter.pty_master_fd())?;
+            let exit_code = get_exit_code(interpreter.id())?;
             Ok(exit_code)
         }
     }
