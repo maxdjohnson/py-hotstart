@@ -101,17 +101,6 @@ fn setup_sigwinch_stream() -> Result<UnixStream> {
     Ok(sigwinch_r)
 }
 
-/// Drain the signal stream after a POLLIN event.
-fn drain_all(sigwinch_r: &mut UnixStream) -> Result<()> {
-    let mut sigbuf = [0u8; 128];
-    while let Ok(n) = sigwinch_r.read(&mut sigbuf) {
-        if n == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
 /// Main polling loop that proxies data between stdin/stdout and the PTY, and handles SIGWINCH.
 fn proxy_loop(
     pty_fd: BorrowedFd,
@@ -143,7 +132,8 @@ fn proxy_loop(
         // Handle SIGWINCH events
         if let Some(revents) = sigwinch_revents {
             if revents.contains(PollFlags::POLLIN) {
-                drain_all(&mut sigwinch_r).context("Failed to drain SIGWINCH stream")?;
+                let mut buf = [0u8; 1];
+                sigwinch_r.read_exact(&mut buf).context("sigwinch_r.read_exact error")?;
                 if let Err(e) = sync_winsize(stdout_fd, pty_fd) {
                     eprintln!("Failed to sync window size: {}", e);
                 }

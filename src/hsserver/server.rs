@@ -130,22 +130,14 @@ impl ServerState {
             .map_or(false, |r| r.contains(PollFlags::POLLIN));
 
         if sigchld_ready {
-            let mut buf = [0u8; 64];
-            while let Ok(n) = self.sigchld_fd.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
+            let mut buf = [0u8; 1];
+            self.sigchld_fd.read_exact(&mut buf).context("sigchld_fd.read_exact error")?;
             self.supervisor.handle_sigchld()?;
         }
 
         if sigterm_ready {
-            let mut buf = [0u8; 64];
-            while let Ok(n) = self.sigterm_fd.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
+            let mut buf = [0u8; 1];
+            self.sigterm_fd.read_exact(&mut buf).context("sigterm_fd.read_exact error")?;
             eprintln!("Received SIGTERM or SIGINT, shutting down gracefully.");
             return Ok(false);
         }
