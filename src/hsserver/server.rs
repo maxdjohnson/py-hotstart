@@ -1,9 +1,10 @@
 use crate::hsserver::daemon::{daemonize, PidFileGuard};
-use crate::hsserver::supervisor::{ChildId, Supervisor};
+use crate::hsserver::supervisor::Supervisor;
+use std::str::FromStr;
+use crate::interpreter::{Interpreter, ChildId};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use anyhow::{bail, Context, Result};
 use nix::libc;
-use nix::pty::PtyMaster;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use nix::unistd::{ForkResult, Pid};
 use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
@@ -15,7 +16,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::str::FromStr;
 use std::time::Duration;
 
 use super::daemon::kill_with_timeout;
@@ -25,17 +25,11 @@ nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 pub const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 const PIDFILE_PATH: &str = "/tmp/py_hotstart.pid";
-const PY_STOP_SUPERVISION: &str = "__supervised__ = False";
-
-struct InterpreterState {
-    id: ChildId,
-    control_fd: UnixStream,
-    pty_master_fd: PtyMaster,
-}
+const PY_STOP_SUPERVISION: &str = "supervised = False; ctrl.write('OK\\n')";
 
 struct ServerState {
     listener: UnixListener,
-    current_interpreter: Option<InterpreterState>,
+    current_interpreter: Option<Interpreter>,
     prelude_code: Option<String>,
     supervisor: Supervisor,
     sigchld_fd: UnixStream,
@@ -85,14 +79,9 @@ impl ServerState {
 
     fn ensure_interpreter(&mut self) -> Result<()> {
         if self.current_interpreter.is_none() {
-            let (id, control_fd, pty_master_fd) = self
+            self.current_interpreter = Some( self
                 .supervisor
-                .spawn_interpreter(self.prelude_code.as_deref())?;
-            self.current_interpreter = Some(InterpreterState {
-                id,
-                control_fd,
-                pty_master_fd,
-            });
+                .spawn_interpreter(self.prelude_code.as_deref())?);
         }
         Ok(())
     }
@@ -205,6 +194,9 @@ impl ServerState {
                 .context("no interpreter")?;
             writeln!(interp.control_fd, "{:?}", PY_STOP_SUPERVISION.trim())
                 .context("Failed to write to interpreter tty")?;
+            let mut response_buf = String::new();
+            interp.control_fd.read_line(&mut response_buf).context("Failed to read from interpreter control fd")?;
+            eprintln!("Received from interpreter: {:?}", response_buf.trim());
             let response = format!("OK {}", interp.id);
             let iov = [IoSlice::new(response.as_bytes())];
             let fds = [interp.control_fd.as_raw_fd(), interp.pty_master_fd.as_raw_fd()];

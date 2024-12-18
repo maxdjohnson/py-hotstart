@@ -1,18 +1,9 @@
 use crate::hsserver::server::{ensure, SOCKET_PATH};
 use anyhow::{bail, Context, Result};
-use nix::cmsg_space;
-use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-use std::io::IoSliceMut;
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-
-pub struct ClientInterpreter {
-    pub id: String,
-    pub control_fd: OwnedFd,
-    pub pty_master_fd: OwnedFd,
-}
+use crate::interpreter::{Interpreter, ChildId};
+use crate::sendfd::RecvWithFd;
 
 pub fn ensure_server() -> Result<()> {
     ensure()?;
@@ -50,47 +41,15 @@ pub fn initialize(prelude: &str) -> Result<()> {
     }
 }
 
-pub fn take_interpreter() -> Result<ClientInterpreter> {
+pub fn take_interpreter() -> Result<Interpreter> {
     let stream = send_request("TAKE")?;
-    let mut buf = [0u8; 32];
-    let mut iov = [IoSliceMut::new(&mut buf)];
-    let mut cmsgspace = cmsg_space!([RawFd; 2]);
-
-    let (n, control_fd, pty_fd) = {
-        let msg = recvmsg::<()>(
-            stream.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsgspace),
-            MsgFlags::empty(),
-        )
-        .context("Failed to recvmsg")?;
-        if msg.bytes == 0 {
-            bail!("No message in response");
-        }
-        let mut control_fd: Option<OwnedFd> = None;
-        let mut pty_fd: Option<OwnedFd> = None;
-        for cmsg in msg.cmsgs()? {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                let mut owned_fds: Vec<OwnedFd> = fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
-                control_fd = Some(owned_fds.remove(0));
-                pty_fd = Some(owned_fds.remove(0));
-            }
-        }
-        (msg.bytes, control_fd.context("No control_fd in response")?, pty_fd.context("No pty_fd in response")?)
-    };
-
-    let resp_str = String::from_utf8_lossy(&iov[0][..n]);
-    let id = resp_str
-        .strip_prefix("OK ")
-        .with_context(|| format!("invalid response {}", resp_str))?;
-    Ok(ClientInterpreter {
-        id: id.to_string(),
-        control_fd,
-        pty_master_fd: pty_fd,
-    })
+    let mut bytes = [0u8; 32]; // Assume max msg len of 32
+    let mut fds = [0; 2];
+    let (n_bytes, n_fds) = stream.recv_with_fd(&mut bytes, &mut fds)?;
+    Ok(unsafe {Interpreter::from_raw(&bytes[..n_bytes], &fds[..n_fds])}?)
 }
 
-pub fn get_exit_code(id: &str) -> Result<i32> {
+pub fn get_exit_code(id: &ChildId) -> Result<i32> {
     let req = format!("EXITCODE {}", id);
     let mut stream = send_request(&req)?;
     let mut buf = [0u8; 1024];

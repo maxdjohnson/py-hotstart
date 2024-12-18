@@ -1,74 +1,24 @@
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{open, OFlag};
 use std::os::unix::net::UnixStream;
+use std::fs::File;
 use nix::libc;
-use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
+use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResult};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fmt;
-use std::os::fd::AsRawFd;
-use std::str::FromStr;
+use std::os::fd::{AsRawFd, IntoRawFd, FromRawFd};
 use std::time::{Duration, Instant};
+use crate::interpreter::{ChildId, Interpreter};
 
 const SCRIPT: &str = include_str!("../pyhotstart.py");
 const SCRIPT_PATH: &str = "/tmp/pyhotstart.py";
 
 // For TIOCSCTTY
 nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
-
-// Pair of child_id and Pid
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChildId {
-    id: u32,
-    pid: Pid,
-}
-
-impl fmt::Display for ChildId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({},{})", self.id, self.pid.as_raw())
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParseChildIdError(String);
-
-impl std::fmt::Display for ParseChildIdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid ChildId: {:?}", self.0)
-    }
-}
-
-impl std::error::Error for ParseChildIdError {}
-
-impl FromStr for ChildId {
-    type Err = ParseChildIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (x, y) = s
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))
-            .and_then(|s| s.split_once(','))
-            .ok_or_else(|| ParseChildIdError(s.to_string()))?;
-
-        let id = x.parse::<u32>().map_err(|_| ParseChildIdError(s.to_string()))?;
-        let pid = y.parse::<libc::pid_t>().map_err(|_| ParseChildIdError(s.to_string()))?;
-
-        Ok(ChildId {
-            id,
-            pid: Pid::from_raw(pid),
-        })
-    }
-}
-
-impl ChildId {
-    fn new(id: u32, pid: Pid) -> Self {
-        ChildId { id, pid }
-    }
-}
 
 pub struct Supervisor {
     next_child_id: u32,
@@ -88,16 +38,12 @@ impl Supervisor {
     pub fn spawn_interpreter(
         &mut self,
         prelude_code: Option<&str>,
-    ) -> Result<(ChildId, UnixStream, PtyMaster)> {
-        let interpreter = Interpreter::spawn(prelude_code)?;
+    ) -> Result<Interpreter> {
+        let interpreter = spawn(self.next_child_id, prelude_code)?;
         let child_id = self.next_child_id;
         self.next_child_id += 1;
-        self.running_children.insert(interpreter.pid, child_id);
-        Ok((
-            ChildId::new(child_id, interpreter.pid),
-            interpreter.control_fd,
-            interpreter.pty_master_fd,
-        ))
+        self.running_children.insert(interpreter.id.pid, child_id);
+        Ok(interpreter)
     }
 
     pub fn get_exit_code(&mut self, child_id: ChildId) -> Result<i32> {
@@ -231,120 +177,67 @@ impl ExitInfoRecord {
     }
 }
 
-struct Interpreter {
-    pid: Pid,
-    control_fd: UnixStream,
-    pty_master_fd: PtyMaster,
-}
+fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
+    // Set up dedicated PTY for interpreter's stdio
+    let master_fd =
+        posix_openpt(OFlag::O_RDWR | OFlag::O_CLOEXEC).context("Failed to open PTY master")?;
+    grantpt(&master_fd).context("Failed to grant PTY")?;
+    unlockpt(&master_fd).context("Failed to unlock PTY")?;
 
-impl Interpreter {
-    fn spawn(prelude_code: Option<&str>) -> Result<Self> {
-        // Set up dedicated PTY for interpreter's stdio
-        let master_fd =
-            posix_openpt(OFlag::O_RDWR | OFlag::O_CLOEXEC).context("Failed to open PTY master")?;
-        grantpt(&master_fd).context("Failed to grant PTY")?;
-        unlockpt(&master_fd).context("Failed to unlock PTY")?;
+    let slave_name = unsafe { ptsname(&master_fd) }.context("Failed to get PTY slave name")?;
+    let slave_path: &str = slave_name.as_ref();
 
-        let slave_name = unsafe { ptsname(&master_fd) }.context("Failed to get PTY slave name")?;
-        let slave_path: &str = slave_name.as_ref();
+    // Create a separate stream for sending instructions to the running interpreter.
+    let (control_r, control_w) = UnixStream::pair().context("Failed to create control socket pair")?;
+    debug_assert!(control_r.as_raw_fd() > 3, "control_r fd is too low");
 
-        // Create a separate stream for sending instructions to the running interpreter.
-        let (control_r, control_w) = UnixStream::pair().context("Failed to create socket pair")?;
-        debug_assert!(control_r.as_raw_fd() > 3, "control_r fd is too low");
+    match unsafe { fork() }.context("fork failed")? {
+        ForkResult::Parent { child } => Ok(Interpreter {
+            id: ChildId::new(id, child),
+            control_fd: control_w,
+            pty_master_fd: unsafe { File::from_raw_fd(master_fd.into_raw_fd()) },
+        }),
+        ForkResult::Child => {
+            // Child: setsid, set controlling TTY
+            setsid().expect("setsid failed");
 
-        match unsafe { fork() }.context("fork failed")? {
-            ForkResult::Parent { child } => Ok(Interpreter {
-                pid: child,
-                control_fd: control_w,
-                pty_master_fd: master_fd,
-            }),
-            ForkResult::Child => {
-                // Child: setsid, set controlling TTY
-                setsid().expect("setsid failed");
+            // Attach tty slave device to stdin, stdout, stderr
+            {
+                // Open slave fd
+                let slave_fd = open(
+                    std::path::Path::new(slave_path),
+                    OFlag::O_RDWR,
+                    Mode::empty(),
+                )
+                .expect("Failed to open pty slave");
 
-                // Attach tty slave device to stdin, stdout, stderr
-                {
-                    // Open slave fd
-                    let slave_fd = open(
-                        std::path::Path::new(slave_path),
-                        OFlag::O_RDWR,
-                        Mode::empty(),
-                    )
-                    .expect("Failed to open pty slave");
-
-                    // Assign to stdin, stdout, stderr
-                    dup2(slave_fd, 0).expect("dup2 stdin failed");
-                    dup2(slave_fd, 1).expect("dup2 stdout failed");
-                    dup2(slave_fd, 2).expect("dup2 stderr failed");
-                    if slave_fd > 2 {
-                        close(slave_fd).expect("failed to close pty slave fd");
-                    }
+                // Assign to stdin, stdout, stderr
+                dup2(slave_fd, 0).expect("dup2 stdin failed");
+                dup2(slave_fd, 1).expect("dup2 stdout failed");
+                dup2(slave_fd, 2).expect("dup2 stderr failed");
+                if slave_fd > 2 {
+                    close(slave_fd).expect("failed to close pty slave fd");
                 }
-
-                // Dup control_r fd to 3 so that it survives exec and can be used by interpreter
-                dup2(control_r.as_raw_fd(), 3).expect("dup2 stderr failed");
-
-                // TIOCSCTTY to acquire controlling terminal
-                unsafe { ioctl_set_ctty(0, 0) }.expect("ioctl(TIOCSCTTY) failed");
-
-                // Set foreground process group
-                let pid = getpid();
-                tcsetpgrp(std::io::stdin(), pid).expect("tcsetpgrp failed");
-
-                // Prepare python command
-                let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
-                std::fs::write(SCRIPT_PATH, script_with_prelude)
-                    .context("Failed to write to temp file")?;
-                let python = CString::new("python3").unwrap();
-                let args = [python.clone(), CString::new(SCRIPT_PATH).unwrap()];
-                execvp(&python, &args).expect("execvp failed");
-                unreachable!()
             }
-        }
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+            // Dup control_r fd to 3 so that it survives exec and can be used by interpreter
+            dup2(control_r.as_raw_fd(), 3).expect("dup2 control failed");
 
-    #[test]
-    fn test_child_id_display_parse() {
-        let id = 2;
-        let pid = Pid::from_raw(81581);
-        let child_id = ChildId::new(id, pid);
-        assert_eq!(child_id.id, id);
-        assert_eq!(child_id.pid, pid);
-        let displayed = format!("{}", child_id);
-        assert_eq!(displayed, "(2,81581)");
-        let child_id2 = ChildId::from_str(&displayed).unwrap();
-        assert_eq!(child_id2, child_id);
-    }
+            // TIOCSCTTY to acquire controlling terminal
+            unsafe { ioctl_set_ctty(0, 0) }.expect("ioctl(TIOCSCTTY) failed");
 
-    #[test]
-    fn test_child_id_from_str_missing_parentheses() {
-        let inputs = ["123,456", "(123,456", "123,456)", ""];
+            // Set foreground process group
+            let pid = getpid();
+            tcsetpgrp(std::io::stdin(), pid).expect("tcsetpgrp failed");
 
-        for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
-        }
-    }
-
-    #[test]
-    fn test_child_id_from_str_missing_comma() {
-        let inputs = ["(123 456)", "(123)", "(,456)", "(123,)"];
-
-        for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
-        }
-    }
-
-    #[test]
-    fn test_child_id_from_str_invalid_numbers() {
-        let inputs = ["(abc,456)", "(123,xyz)", "(abc,xyz)"];
-
-        for input in inputs {
-            assert!(ChildId::from_str(input).is_err(), "Should fail for input: {}", input);
+            // Prepare python command
+            let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
+            std::fs::write(SCRIPT_PATH, script_with_prelude)
+                .context("Failed to write to temp file")?;
+            let python = CString::new("python3").unwrap();
+            let args = [python.clone(), CString::new(SCRIPT_PATH).unwrap()];
+            execvp(&python, &args).expect("execvp failed");
+            unreachable!()
         }
     }
 }

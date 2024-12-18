@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Context, Result};
+use std::net::Shutdown;
 use clap::{Arg, ArgAction, Command};
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::env;
 
-use crate::hsclient::client::{get_exit_code, initialize, ClientInterpreter, take_interpreter, ensure_server};
-use crate::hsclient::proxy::{do_proxy, write_all};
+use crate::hsclient::client::{get_exit_code, initialize, take_interpreter, ensure_server};
+use crate::hsclient::proxy::do_proxy;
 use crate::hsserver::server::restart;
+use crate::interpreter::Interpreter;
 
 use super::proxy::TerminalModeGuard;
 
@@ -173,12 +176,12 @@ pub fn main() -> Result<i32> {
         Args::Run(run_mode) => {
             let terminal_mode = TerminalModeGuard::new(std::io::stdin().as_fd())?;
             let instructions = generate_instructions(&terminal_mode, run_mode)?;
-            let ClientInterpreter { id, control_fd, pty_master_fd } = take_interpreter()?;
+            let Interpreter { id, mut control_fd, pty_master_fd } = take_interpreter()?;
 
             // Write instructions to interpreter and close the control fd to start it
             let instructions_literal = format!("{:?}\n", instructions);
-            write_all(&control_fd, instructions_literal.as_bytes())
-                .context("Failed to write instructions to interpreter")?;
+            control_fd.write_all(instructions_literal.as_bytes()).context("Failed to write instructions to interpreter")?;
+            control_fd.shutdown(Shutdown::Both).context("shutdown function failed")?;
             drop(control_fd);
 
             // Proxy the interpreter's pty until it's done, then return exit code

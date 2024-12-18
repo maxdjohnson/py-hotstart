@@ -1,4 +1,6 @@
 mod hsclient;
+mod interpreter;
+mod sendfd;
 mod hsserver;
 
 fn main() {
