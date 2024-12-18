@@ -35,7 +35,6 @@ impl TerminalModeGuard {
             original,
         })
     }
-
     pub fn get_original(&self) -> &Termios {
         &self.original
     }

@@ -98,7 +98,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args::Run(run_mode))
 }
 
-fn generate_instructions(run_mode: RunMode) -> Result<String> {
+fn generate_instructions(terminal_mode: &TerminalModeGuard, run_mode: RunMode) -> Result<String> {
     let cwd = env::current_dir().context("Failed to get current directory")?;
     let cwd_str = cwd.to_str().ok_or_else(|| anyhow!("CWD not UTF-8"))?;
     let env_vars: HashMap<String, String> = env::vars().collect();
@@ -131,6 +131,17 @@ fn generate_instructions(run_mode: RunMode) -> Result<String> {
     };
     let argv_str = json::stringify(argv);
 
+    let mode = terminal_mode.get_original();
+    let cc_elems = &mode.control_chars
+        .iter()
+        .map(|b| format!("b'\\x{:02x}'", b))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cc = format!("[{}]", cc_elems);
+    let iflag = mode.input_flags.bits();
+    let oflag = mode.output_flags.bits();
+    let cflag = mode.control_flags.bits();
+    let lflag = mode.local_flags.bits();
     let instructions = format!(
         r#"import sys, os, termios
 
@@ -139,6 +150,7 @@ os.environ.update({env_str})
 os.chdir({cwd_str:?})
 sys.argv.clear()
 sys.argv.extend({argv_str})
+termios.tcsetattr(0, termios.TCSANOW, [{iflag}, {oflag}, {cflag}, {lflag}, 38400, 38400, {cc}])
 
 {snippet}
 "#,
@@ -159,7 +171,8 @@ pub fn main() -> Result<i32> {
             Ok(0)
         }
         Args::Run(run_mode) => {
-            let instructions = generate_instructions(run_mode)?;
+            let terminal_mode = TerminalModeGuard::new(std::io::stdin().as_fd())?;
+            let instructions = generate_instructions(&terminal_mode, run_mode)?;
             let ClientInterpreter { id, control_fd, pty_master_fd } = take_interpreter()?;
 
             // Write instructions to interpreter and close the control fd to start it
@@ -169,7 +182,6 @@ pub fn main() -> Result<i32> {
             drop(control_fd);
 
             // Proxy the interpreter's pty until it's done, then return exit code
-            let terminal_mode = TerminalModeGuard::new(std::io::stdin().as_fd())?;
             do_proxy(&terminal_mode, pty_master_fd.as_fd())?;
             let exit_code = get_exit_code(&id)?;
             Ok(exit_code)

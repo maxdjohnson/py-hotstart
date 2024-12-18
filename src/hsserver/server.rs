@@ -25,7 +25,7 @@ nix::ioctl_write_int_bad!(ioctl_set_ctty, libc::TIOCSCTTY);
 
 pub const SOCKET_PATH: &str = "/tmp/py_hotstart.sock";
 const PIDFILE_PATH: &str = "/tmp/py_hotstart.pid";
-const PY_STOP_SUPERVISION: &str = "__py_hotstart_supervised__ == False";
+const PY_STOP_SUPERVISION: &str = "__supervised__ = False";
 
 struct InterpreterState {
     id: ChildId,
@@ -203,7 +203,7 @@ impl ServerState {
                 .current_interpreter
                 .as_mut()
                 .context("no interpreter")?;
-            writeln!(interp.control_fd, "{}", PY_STOP_SUPERVISION.trim())
+            writeln!(interp.control_fd, "{:?}", PY_STOP_SUPERVISION.trim())
                 .context("Failed to write to interpreter tty")?;
             let response = format!("OK {}", interp.id);
             let iov = [IoSlice::new(response.as_bytes())];
