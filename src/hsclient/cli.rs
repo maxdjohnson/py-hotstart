@@ -179,7 +179,10 @@ pub fn main() -> Result<i32> {
             interpreter.run_instructions(&instructions)?;
 
             // Proxy the interpreter's pty until it's done, then return exit code
-            do_proxy(&terminal_mode, interpreter.pty_master_fd().as_fd())?;
+            do_proxy(
+                &terminal_mode,
+                interpreter.take_pty_master().context("no pty")?,
+            )?;
             let exit_code = get_exit_code(interpreter.id())?;
             Ok(exit_code)
         }

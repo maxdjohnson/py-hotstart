@@ -2,7 +2,7 @@ use nix::libc;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 use nix::sys::socket::{sendmsg, ControlMessage};
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net;
 
 /// An extension trait that enables sending associated file descriptors along with the data.
@@ -120,5 +120,71 @@ mod tests {
         if l.send_with_fd(&sent_bytes[..], &[0xffi32][..]).is_ok() {
             panic!("expected an error when sending a junk file descriptor");
         }
+    }
+}
+
+/// Representation of the Master device in a master/slave pty pair. Copied from nix to add
+/// From<OwnedFd> trait impl.
+#[derive(Debug)]
+pub struct PtyMaster(OwnedFd);
+
+impl From<OwnedFd> for PtyMaster {
+    fn from(fd: OwnedFd) -> Self {
+        PtyMaster(fd)
+    }
+}
+
+impl From<nix::pty::PtyMaster> for PtyMaster {
+    fn from(fd: nix::pty::PtyMaster) -> Self {
+        unsafe { OwnedFd::from_raw_fd(fd.into_raw_fd()) }.into()
+    }
+}
+
+impl AsRawFd for PtyMaster {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl AsFd for PtyMaster {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl IntoRawFd for PtyMaster {
+    fn into_raw_fd(self) -> RawFd {
+        let fd = self.0;
+        fd.into_raw_fd()
+    }
+}
+
+impl io::Read for PtyMaster {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        nix::unistd::read(self.0.as_raw_fd(), buf).map_err(io::Error::from)
+    }
+}
+
+impl io::Write for PtyMaster {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        nix::unistd::write(&self.0, buf).map_err(io::Error::from)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Read for &PtyMaster {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        nix::unistd::read(self.0.as_raw_fd(), buf).map_err(io::Error::from)
+    }
+}
+
+impl io::Write for &PtyMaster {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        nix::unistd::write(&self.0, buf).map_err(io::Error::from)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

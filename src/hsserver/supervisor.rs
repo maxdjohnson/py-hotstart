@@ -9,8 +9,7 @@ use nix::unistd::Pid;
 use nix::unistd::{close, dup2, execvp, fork, getpid, setsid, tcsetpgrp, ForkResult};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -178,9 +177,11 @@ impl ExitInfoRecord {
 fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
     // Write script
     let script_with_prelude = SCRIPT.replace("# prelude", prelude_code.unwrap_or(""));
-    std::fs::write(SCRIPT_PATH, script_with_prelude)
-        .context("Failed to write to temp file")?;
-    eprintln!("Starting interpreter prelude={:?} path={}", prelude_code, SCRIPT_PATH);
+    std::fs::write(SCRIPT_PATH, script_with_prelude).context("Failed to write to temp file")?;
+    eprintln!(
+        "Starting interpreter prelude={:?} path={}",
+        prelude_code, SCRIPT_PATH
+    );
 
     // Set up dedicated PTY for interpreter's stdio
     let master_fd =
@@ -200,7 +201,7 @@ fn spawn(id: u32, prelude_code: Option<&str>) -> Result<Interpreter> {
         ForkResult::Parent { child } => Ok(Interpreter::new(
             ChildId::new(id, child),
             control_w,
-            unsafe { File::from_raw_fd(master_fd.into_raw_fd()) },
+            master_fd.into(),
         )),
         ForkResult::Child => {
             // Child: setsid, set controlling TTY

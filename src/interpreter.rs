@@ -1,8 +1,8 @@
+use crate::sendfd::PtyMaster;
 use anyhow::Result;
 use nix::libc;
 use nix::unistd::Pid;
 use std::fmt;
-use std::fs::File;
 use std::io::Write;
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
@@ -67,16 +67,16 @@ impl ChildId {
 pub struct Interpreter {
     id: ChildId,
     control_fd: UnixStream,
-    pty_master_fd: File,
+    pty_master: Option<PtyMaster>,
     supervised: bool,
 }
 
 impl Interpreter {
-    pub fn new(id: ChildId, control_fd: UnixStream, pty_master_fd: File) -> Self {
+    pub fn new(id: ChildId, control_fd: UnixStream, pty_master: PtyMaster) -> Self {
         Interpreter {
             id,
             control_fd,
-            pty_master_fd,
+            pty_master: Some(pty_master),
             supervised: true,
         }
     }
@@ -85,13 +85,16 @@ impl Interpreter {
         &self.id
     }
 
-    pub fn pty_master_fd(&self) -> &File {
-        &self.pty_master_fd
+    pub fn take_pty_master(&mut self) -> Option<PtyMaster> {
+        self.pty_master.take()
     }
 
     pub fn unsupervise(&mut self) -> Result<()> {
         let stop_supervision = "supervised = False";
-        if let Err(err) = self.control_fd.write_all(format!("{:?}\n", stop_supervision).as_ref()) {
+        if let Err(err) = self
+            .control_fd
+            .write_all(format!("{:?}\n", stop_supervision).as_ref())
+        {
             // This can happen if interpreter has died
             eprintln!("interpreter unsupervise err writing to control_fd: {}", err);
         }
@@ -101,7 +104,10 @@ impl Interpreter {
 
     pub fn run_instructions(&mut self, instructions: &str) -> Result<()> {
         assert!(!self.supervised, "still supervised");
-        if let Err(err) = self.control_fd.write_all(format!("{:?}\n", instructions).as_ref()) {
+        if let Err(err) = self
+            .control_fd
+            .write_all(format!("{:?}\n", instructions).as_ref())
+        {
             eprintln!("interpreter run_instructions send failed: {}", err);
         }
         let _ = self.control_fd.shutdown(Shutdown::Both); // ignore error
@@ -109,11 +115,14 @@ impl Interpreter {
     }
 
     pub unsafe fn from_raw(msg: &[u8], fds: &[RawFd]) -> Result<Self> {
-        let control_fd = UnixStream::from_raw_fd(fds[0]);
         Ok(Interpreter {
             id: ChildId::from_str(&String::from_utf8_lossy(msg))?,
-            control_fd,
-            pty_master_fd: OwnedFd::from_raw_fd(fds[1]).into(),
+            control_fd: UnixStream::from_raw_fd(fds[0]),
+            pty_master: if fds.len() > 1 {
+                Some(OwnedFd::from_raw_fd(fds[1]).into())
+            } else {
+                None
+            },
             supervised: false,
         })
     }
@@ -121,7 +130,10 @@ impl Interpreter {
     pub fn to_raw(&self) -> (Vec<u8>, Vec<RawFd>) {
         assert!(!self.supervised, "cannot send supervised interpreter");
         let msg = self.id.to_string().into_bytes();
-        let fds = vec![self.control_fd.as_raw_fd(), self.pty_master_fd.as_raw_fd()];
+        let mut fds = vec![self.control_fd.as_raw_fd()];
+        if let Some(fd) = &self.pty_master {
+            fds.push(fd.as_raw_fd());
+        }
         (msg, fds)
     }
 }
