@@ -67,62 +67,6 @@ impl RecvWithFd for net::UnixStream {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{RecvWithFd, SendWithFd};
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    use std::os::unix::net;
-
-    #[test]
-    fn stream_works() {
-        let (l, r) = net::UnixStream::pair().expect("create UnixStream pair");
-        let sent_bytes = b"hello world!";
-        let sent_fds = [l.as_raw_fd(), r.as_raw_fd()];
-        assert_eq!(
-            l.send_with_fd(&sent_bytes[..], &sent_fds[..])
-                .expect("send should be successful"),
-            sent_bytes.len()
-        );
-        let mut recv_bytes = [0; 128];
-        let mut recv_fds = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(
-            r.recv_with_fd(&mut recv_bytes, &mut recv_fds)
-                .expect("recv should be successful"),
-            (sent_bytes.len(), sent_fds.len())
-        );
-        assert_eq!(recv_bytes[..sent_bytes.len()], sent_bytes[..]);
-        for (&sent, &recvd) in sent_fds.iter().zip(&recv_fds[..]) {
-            // Modify the sent resource and check if the received resource has been modified the
-            // same way.
-            let expected_value = Some(std::time::Duration::from_secs(42));
-            unsafe {
-                let s = net::UnixStream::from_raw_fd(sent);
-                s.set_read_timeout(expected_value)
-                    .expect("set read timeout");
-                std::mem::forget(s);
-                assert_eq!(
-                    net::UnixStream::from_raw_fd(recvd)
-                        .read_timeout()
-                        .expect("get read timeout"),
-                    expected_value
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sending_junk_fails() {
-        let (l, _) = net::UnixStream::pair().expect("create UnixStream pair");
-        let sent_bytes = b"hello world!";
-        if l.send_with_fd(&sent_bytes[..], &[i32::MAX][..]).is_ok() {
-            panic!("expected an error when sending a junk file descriptor");
-        }
-        if l.send_with_fd(&sent_bytes[..], &[0xffi32][..]).is_ok() {
-            panic!("expected an error when sending a junk file descriptor");
-        }
-    }
-}
-
 /// Representation of the Master device in a master/slave pty pair. Copied from nix to add
 /// From<OwnedFd> trait impl.
 #[derive(Debug)]
@@ -186,5 +130,61 @@ impl io::Write for &PtyMaster {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecvWithFd, SendWithFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::net;
+
+    #[test]
+    fn stream_works() {
+        let (l, r) = net::UnixStream::pair().expect("create UnixStream pair");
+        let sent_bytes = b"hello world!";
+        let sent_fds = [l.as_raw_fd(), r.as_raw_fd()];
+        assert_eq!(
+            l.send_with_fd(&sent_bytes[..], &sent_fds[..])
+                .expect("send should be successful"),
+            sent_bytes.len()
+        );
+        let mut recv_bytes = [0; 128];
+        let mut recv_fds = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            r.recv_with_fd(&mut recv_bytes, &mut recv_fds)
+                .expect("recv should be successful"),
+            (sent_bytes.len(), sent_fds.len())
+        );
+        assert_eq!(recv_bytes[..sent_bytes.len()], sent_bytes[..]);
+        for (&sent, &recvd) in sent_fds.iter().zip(&recv_fds[..]) {
+            // Modify the sent resource and check if the received resource has been modified the
+            // same way.
+            let expected_value = Some(std::time::Duration::from_secs(42));
+            unsafe {
+                let s = net::UnixStream::from_raw_fd(sent);
+                s.set_read_timeout(expected_value)
+                    .expect("set read timeout");
+                std::mem::forget(s);
+                assert_eq!(
+                    net::UnixStream::from_raw_fd(recvd)
+                        .read_timeout()
+                        .expect("get read timeout"),
+                    expected_value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sending_junk_fails() {
+        let (l, _) = net::UnixStream::pair().expect("create UnixStream pair");
+        let sent_bytes = b"hello world!";
+        if l.send_with_fd(&sent_bytes[..], &[i32::MAX][..]).is_ok() {
+            panic!("expected an error when sending a junk file descriptor");
+        }
+        if l.send_with_fd(&sent_bytes[..], &[0xffi32][..]).is_ok() {
+            panic!("expected an error when sending a junk file descriptor");
+        }
     }
 }
