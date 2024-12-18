@@ -20,7 +20,6 @@ def __py_hotstart_loop__():
 
         # Supervision done. Read the rest of ctrl for instructions, then shut down socket.
         line = ctrl.read().strip()
-        sock.shutdown(socket.SHUT_RDWR)
 
         # Parse instructions from string with eval, and return it.
         return eval(line)
